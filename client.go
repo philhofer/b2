@@ -120,7 +120,7 @@ type Client struct {
 	// Cap is the set of capabilities associated
 	// with the current AuthToken. As a special case,
 	// a zero Cap means unknown capabilities.
-	Cap      Capabilities
+	Cap Capabilities
 
 	// PartSize is the recommended part size for
 	// file uploads.
@@ -242,14 +242,14 @@ func (c *Client) api(op string, body, res interface{}) error {
 
 // FileInfo represents information about a file.
 type FileInfo struct {
-	Type        string            `json:"action"` // "upload" or "folder"
-	ContentType string            `json:"contentType"` // ContentType is the value of the Content-Type HTTP header
-	ID          string            `json:"fileId"` // ID is the file ID
-	Name        string            `json:"fileName"` // Name is the file name
-	Bucket      string            `json:"-"` // Bucket is the bucket containing the file
-	Size        int64             `json:"size"` // Size is the size of the file
+	Type        string            `json:"action"`             // "upload" or "folder"
+	ContentType string            `json:"contentType"`        // ContentType is the value of the Content-Type HTTP header
+	ID          string            `json:"fileId"`             // ID is the file ID
+	Name        string            `json:"fileName"`           // Name is the file name
+	Bucket      string            `json:"-"`                  // Bucket is the bucket containing the file
+	Size        int64             `json:"size"`               // Size is the size of the file
 	Extra       map[string]string `json:"fileInfo,omitempty"` // Extra contains extra file metadata
-	Timestamp   int64             `json:"uploadTimestamp"` // Timestamp, unix milliseconds
+	Timestamp   int64             `json:"uploadTimestamp"`    // Timestamp, unix milliseconds
 }
 
 func (f *FileInfo) Created() time.Time {
@@ -327,18 +327,22 @@ func (c *Client) get(uri string) (*File, error) {
 // It is the caller's responsibility to close File.Body
 // after using the data.
 func (c *Client) Get(bucket, name string) (*File, error) {
-	return c.get(c.URL.Download+"/file/"+bucket+"/"+name)
+	f, err := c.get(c.URL.Download + "/file/" + bucket + "/" + name)
+	if f != nil {
+		f.Bucket = bucket
+	}
+	return f, err
 }
 
 // GetID gets a file by its ID.
 // It is the caller's responsibility to close File.Body
 // after using the data.
 func (c *Client) GetID(id string) (*File, error) {
-	return c.get(c.URL.Download+"/b2api/v1/b2_download_file_by_id?fileId="+url.QueryEscape(id))
+	return c.get(c.URL.Download + "/b2api/v1/b2_download_file_by_id?fileId=" + url.QueryEscape(id))
 }
 
 type Bucket struct {
-	ID string   `json:"bucketId"`
+	ID   string `json:"bucketId"`
 	Name string `json:"bucketName"`
 	Type string `json:"bucketType"` // "allPrivate" "allPublic" "snapshot"
 }
@@ -349,11 +353,11 @@ func (c *Client) Buckets(types ...string) ([]Bucket, error) {
 	if len(types) == 0 {
 		types = []string{"allPrivate", "allPublic", "snapshot"}
 	}
-	req := struct{
-		ID string `json:"accountId"`
+	req := struct {
+		ID    string   `json:"accountId"`
 		Types []string `json:"bucketTypes"`
 	}{c.AccountID, types}
-	res := struct{
+	res := struct {
 		Buckets []Bucket `json:"buckets"`
 	}{}
 	err := c.api("b2_list_buckets", &req, &res)
@@ -372,12 +376,12 @@ func (c *Client) ListBucket(bucket *Bucket, start string, max int) ([]FileInfo, 
 	if max > 10000 || max < 0 {
 		max = 10000
 	}
-	req := struct{
+	req := struct {
 		Bucket string `json:"bucketId"`
 	}{bucket.ID}
-	res := struct{
+	res := struct {
 		Files []FileInfo `json:"files"`
-		Next *string `json:"nextFileName"`
+		Next  *string    `json:"nextFileName"`
 	}{}
 	err := c.api("b2_list_file_names", &req, &res)
 	if err != nil {

@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
-	"time"
 	"net"
+	"time"
 )
 
 type Config struct {

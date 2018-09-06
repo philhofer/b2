@@ -1,14 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
+	"io"
 	"log"
 	"net"
 	"net/http"
-	"io"
-	"strconv"
 	"os"
-	"encoding/json"
 	"time"
 
 	"github.com/philhofer/b2"
@@ -20,21 +19,18 @@ func init() {
 	flag.StringVar(&conffile, "c", "config.json", "path to config file")
 }
 
-func auth(c *Config) *b2.Client {
-	log.Println("authorizing with B2...")
-	b2c, err := b2.Authorize(c.B2KeyID, c.B2Key)
-	if err != nil {
-		log.Fatalf("couldn't auth with given B2 keys: %s", err)
-	}
-	return b2c
+type server struct {
+	b2c      *b2.Client
+	conf     Config
+	meta     table
+	host     string // host part of Config.LocalAddress
+	bucketID string // ID of conf.Bucket
 }
 
-type server struct {
-	b2c   *b2.Client
-	conf  Config
-	meta  table
-	host  string // host part of Config.LocalAddress
-	bucketID string // ID of conf.Bucket
+func (s *server) auth() error {
+	var err error
+	s.b2c, err = b2.Authorize(s.conf.B2KeyID, s.conf.B2Key)
+	return err
 }
 
 func (s *server) allowsOrigin(origin string) bool {
@@ -75,7 +71,6 @@ func errconv(w http.ResponseWriter, err error) {
 		io.WriteString(w, b2err.Message)
 		return
 	}
-	// if we can't reach B2, call a spade a spade
 	if _, ok := err.(net.Error); ok {
 		w.WriteHeader(502)
 		io.WriteString(w, "bad gateway")
@@ -91,10 +86,6 @@ func sethdr(w http.ResponseWriter, info *cacheinfo) {
 	for i := range info.headers {
 		h.Set(info.headers[i][0], info.headers[i][1])
 	}
-	h.Set("Content-Type", info.info.ContentType)
-	h.Set("Content-Length", strconv.FormatInt(info.info.Size, 10))
-	h.Set("ETag", info.etag)
-	h.Set("Last-Modified", info.info.Created().Format(time.RFC1123))
 }
 
 func (s *server) loadconf() {
@@ -154,17 +145,11 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// handle If-None-Match, If-Modified-Since
-	if req.Method == "GET" || req.Method == "HEAD" {
+	switch req.Method {
+	case "GET":
 		if s.earlyOut(w, req.Header, &info) {
 			return
 		}
-	}
-
-	// see if we can bail out early based on a conditional op
-
-	switch req.Method {
-	case "GET":
 		// TODO: support Range headers; they
 		// can be forwarded directly to B2 (in principle...)
 		f, err := s.b2c.GetID(info.info.ID)
@@ -177,6 +162,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(200)
 		io.Copy(w, f.Body)
 	case "HEAD":
+		if s.earlyOut(w, req.Header, &info) {
+			return
+		}
 		sethdr(w, &info)
 		w.WriteHeader(200)
 	case "OPTIONS":
@@ -188,27 +176,34 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func (s *server) refresh() {
+	for {
+		time.Sleep(s.conf.RefreshInterval)
+		err := s.populate()
+		if err != nil {
+			log.Printf("couldn't fill metadata cache: %s", err)
+		}
+	}
+}
+
 func main() {
 	flag.Parse()
 	s := new(server)
 	s.meta.init()
 	s.loadconf()
-	s.b2c = auth(&s.conf)
+
+	log.Println("authenticating with B2...")
+	if err := s.auth(); err != nil {
+		log.Fatalf("couldn't authenticate with B2: %s", err)
+	}
 
 	log.Println("downloading and indexing metadata...")
 	if err := s.populate(); err != nil {
 		log.Fatal("couldn't fill metadata cache: %s", err)
 	}
 
-	go func() {
-		time.Sleep(s.conf.RefreshInterval)
-		err := s.populate()
-		if err != nil {
-			log.Printf("couldn't fill metadata cache: %s", err)
-		}
-	}()
-
 	log.Printf("beginning server on %s", s.conf.LocalAddress)
+	go s.refresh()
 
 	// use http.ServeMux for matching 'Host: '
 	mux := http.NewServeMux()

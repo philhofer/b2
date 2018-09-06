@@ -1,20 +1,17 @@
 package main
 
 import (
-	"sync"
-	"strings"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"strconv"
+	"strings"
+	"sync"
+	"time"
 
-	"github.com/philhofer/b2"
 	"github.com/dchest/siphash"
+	"github.com/philhofer/b2"
 )
-
-func toplvl(u uint64) uint {
-	return uint(u & 7)
-}
 
 type table struct {
 	toplevel [8]hbucket
@@ -51,7 +48,7 @@ func init() {
 }
 
 func (t *table) bucket(name string) *hbucket {
-	return &t.toplevel[toplvl(siphash.Hash(seed0, seed1, []byte(name)))]
+	return &t.toplevel[siphash.Hash(seed0, seed1, []byte(name))&7]
 }
 
 func (t *table) update(meta *b2.FileInfo) {
@@ -66,11 +63,8 @@ func (t *table) update(meta *b2.FileInfo) {
 	e.info = *meta
 	// don't save Extra; we don't use it and it might be large
 	e.info.Extra = nil
-	// generate an ETag that represents the file ID,
-	// but don't use the file version (or an unseeded hash of it),
-	// since leaking the actual file ID might be problematic
-	// from a security perspective
-	e.etag = strconv.FormatUint(siphash.Hash(seed0, seed1, []byte(meta.ID)), 36)
+
+	e.etag = etag(meta.ID)
 	e.headers = headers
 	h.lock.Unlock()
 }
@@ -88,14 +82,27 @@ func (t *table) get(name string, out *cacheinfo) bool {
 	return ok
 }
 
-const CustomHeaderPrefix = "HTTP-"
+// generate an ETag that represents the file ID,
+// but don't use the file version (or an unseeded hash of it),
+// since leaking the actual file ID might be problematic
+// from a security perspective
+func etag(id string) string {
+	return strconv.FormatUint(siphash.Hash(seed0, seed1, []byte(id)), 36)
+}
 
 func fiheader(fi *b2.FileInfo) [][2]string {
-	var out [][2]string
+	const CustomHeaderPrefix = "HTTP-"
+
+	out := [][2]string{
+		{"Content-Type", fi.ContentType},
+		{"Content-Length", strconv.FormatInt(fi.Size, 10)},
+		{"ETag", etag(fi.ID)},
+		{"Last-Modified", fi.Created().Format(time.RFC1123)},
+	}
 	for k, v := range fi.Extra {
 		l := len(k)
 		s := strings.TrimPrefix(k, CustomHeaderPrefix)
-		if len(s) == l - len(CustomHeaderPrefix) {
+		if len(s) == l-len(CustomHeaderPrefix) {
 			out = append(out, [2]string{s, v})
 		}
 	}
@@ -105,7 +112,7 @@ func fiheader(fi *b2.FileInfo) [][2]string {
 func (s *server) loadBucket() (*b2.Bucket, error) {
 	if s.bucketID != "" {
 		return &b2.Bucket{
-			ID: s.bucketID,
+			ID:   s.bucketID,
 			Name: s.conf.Bucket,
 		}, nil
 	}
