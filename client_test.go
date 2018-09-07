@@ -63,11 +63,11 @@ func TestHappyCase(t *testing.T) {
 	if client.AuthToken != "the-auth-token" {
 		t.Error("bad auth token")
 	}
-	if client.URL.API != "https://api-host.api-sub.backblaze.com" {
-		t.Errorf("bad api url: %s", client.URL.API)
+	if client.Host.API != "api-host.api-sub.backblaze.com" {
+		t.Errorf("bad api url: %s", client.Host.API)
 	}
-	if client.URL.Download != "https://data-host.data-sub.backblaze.com" {
-		t.Errorf("bad download url: %s", client.URL.Download)
+	if client.Host.Download != "data-host.data-sub.backblaze.com" {
+		t.Errorf("bad download url: %s", client.Host.Download)
 	}
 	if client.Cap != CapListBuckets|CapReadFiles|CapWriteFiles {
 		t.Errorf("bad capabilities: %v", client.Cap)

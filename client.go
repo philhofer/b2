@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -108,16 +109,16 @@ func (c *Capabilities) UnmarshalJSON(buf []byte) error {
 	return nil
 }
 
-func checkURL(text string) error {
+func checkURL(text string) (string, error) {
 	u, err := url.Parse(text)
 	if err != nil {
-		return err
+		return "", err
 	}
 	// refuse obviously insecure schemes
 	if u.Scheme != "https" {
-		return fmt.Errorf("unsupported URL scheme %q", u.Scheme)
+		return "", fmt.Errorf("unsupported URL scheme %q", u.Scheme)
 	}
-	return nil
+	return u.Host, nil
 }
 
 // Client represents a client to the Backblaze b2 API.
@@ -125,7 +126,10 @@ func checkURL(text string) error {
 type Client struct {
 	AccountID string
 	AuthToken string
-	URL       struct {
+	KeyID     string
+	Key       string
+
+	Host struct {
 		API      string
 		Download string
 	}
@@ -145,6 +149,12 @@ type Client struct {
 	// Client is the http.Client used to make requests.
 	// If Client is nil, then http.DefaultClient is used.
 	Client *http.Client
+
+	// AutoRenew determines whether or not the client
+	// automatically fetches a new auth token when
+	// it receives a response that the auth token
+	// has expired.
+	AutoRenew bool
 }
 
 // Error represents an error returned from the B2 API
@@ -204,25 +214,27 @@ func Authorize(keyID, key string) (*Client, error) {
 		return nil, err
 	}
 
-	err = checkURL(val.URL)
-	if err != nil {
-		return nil, fmt.Errorf("b2: refusing bad api URL %q %s", val.URL, err)
-	}
-	err = checkURL(val.Download)
-	if err != nil {
-		return nil, fmt.Errorf("b2: refusing bad download URL %q %s", val.Download, err)
-	}
-
 	c := &Client{
 		AccountID:   val.ID,
+		KeyID:       keyID,
+		Key:         key,
 		AuthToken:   val.Auth,
 		Cap:         val.Cap,
 		PartSize:    val.PartSize,
 		MinPartSize: val.MinPartSize,
 		Client:      http.DefaultClient,
 	}
-	c.URL.API = val.URL
-	c.URL.Download = val.Download
+	var host string
+	host, err = checkURL(val.URL)
+	if err != nil {
+		return nil, fmt.Errorf("refusing bad api url %q", val.URL)
+	}
+	c.Host.API = host
+	host, err = checkURL(val.Download)
+	if err != nil {
+		return nil, fmt.Errorf("refusing bad download url %q", val.Download)
+	}
+	c.Host.Download = host
 	return c, nil
 }
 
@@ -233,20 +245,50 @@ func (c *Client) http() *http.Client {
 	return c.Client
 }
 
+func (c *Client) apireq(method, path string, body interface{}) *http.Request {
+	buf, err := json.Marshal(body)
+	if err != nil {
+		panic(err)
+	}
+	req := &http.Request{
+		URL: &url.URL{
+			Scheme: "https",
+			Host:   c.Host.API,
+			Path:   path,
+		},
+		Header:        make(http.Header),
+		Method:        method,
+		Body:          ioutil.NopCloser(bytes.NewReader(buf)),
+		ContentLength: int64(len(buf)),
+	}
+	req.Header.Set("Authorization", c.AuthToken)
+	req.Header.Set("Content-Type", "application/json")
+	return req
+}
+
 func (c *Client) has(cap Capabilities) bool {
 	return c.Cap&cap == cap
 }
 
-func (c *Client) api(op string, body, res interface{}) error {
-	buf, err := json.Marshal(body)
+func (c *Client) renew(inerr *Error, code int) error {
+	if !c.AutoRenew || code != 401 {
+		return inerr
+	}
+	if inerr.Code != "expired_auth_token" &&
+		inerr.Code != "bad_auth_token" {
+		return inerr
+	}
+	nc, err := Authorize(c.KeyID, c.Key)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest("POST", c.URL.API+"/b2api/v1/"+op, bytes.NewReader(buf))
-	if err != nil {
-		panic(err)
-	}
-	req.Header.Set("Authorization", c.AuthToken)
+	*c = *nc
+	return nil
+}
+
+func (c *Client) api(op string, body, res interface{}) error {
+again:
+	req := c.apireq("POST", "/b2api/v1/"+op, body)
 	hres, err := c.http().Do(req)
 	if err != nil {
 		return err
@@ -256,7 +298,11 @@ func (c *Client) api(op string, body, res interface{}) error {
 	if hres.StatusCode != 200 {
 		e := &Error{Op: op}
 		d.Decode(e)
-		return e
+		err = c.renew(e, hres.StatusCode)
+		if err == nil {
+			goto again
+		}
+		return err
 	}
 	return d.Decode(res)
 }
@@ -288,13 +334,20 @@ type File struct {
 }
 
 // make a download GET request to the given URI
-func (c *Client) get(uri string) (*File, error) {
+func (c *Client) get(uri, query string) (*File, error) {
+again:
 	if c.Cap != 0 && !c.has(CapReadFiles) {
 		return nil, fmt.Errorf("capabilities %q insufficient for reading files", c.Cap.String())
 	}
-	req, err := http.NewRequest("GET", uri, nil)
-	if err != nil {
-		panic(err)
+	req := &http.Request{
+		Method: "GET",
+		URL: &url.URL{
+			Host:     c.Host.Download,
+			Path:     uri,
+			Scheme:   "https",
+			RawQuery: query,
+		},
+		Header: make(http.Header),
 	}
 	req.Header.Set("Authorization", c.AuthToken)
 	res, err := c.http().Do(req)
@@ -305,7 +358,11 @@ func (c *Client) get(uri string) (*File, error) {
 		e := &Error{Op: "GET " + req.URL.String(), Status: res.StatusCode}
 		json.NewDecoder(res.Body).Decode(e)
 		res.Body.Close()
-		return nil, e
+		err = c.renew(e, res.StatusCode)
+		if err == nil {
+			goto again
+		}
+		return nil, err
 	}
 
 	h := res.Header
@@ -348,7 +405,7 @@ func (c *Client) get(uri string) (*File, error) {
 // It is the caller's responsibility to close File.Body
 // after using the data.
 func (c *Client) Get(bucket, name string) (*File, error) {
-	f, err := c.get(c.URL.Download + "/file/" + bucket + "/" + name)
+	f, err := c.get("/file/"+bucket+"/"+name, "")
 	if f != nil {
 		f.Bucket = bucket
 	}
@@ -359,7 +416,7 @@ func (c *Client) Get(bucket, name string) (*File, error) {
 // It is the caller's responsibility to close File.Body
 // after using the data.
 func (c *Client) GetID(id string) (*File, error) {
-	return c.get(c.URL.Download + "/b2api/v1/b2_download_file_by_id?fileId=" + url.QueryEscape(id))
+	return c.get("/b2api/v1/b2_download_file_by_id", "fileId="+url.QueryEscape(id))
 }
 
 type Bucket struct {

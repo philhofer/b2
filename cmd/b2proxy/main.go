@@ -31,6 +31,7 @@ type server struct {
 func (s *server) auth() error {
 	var err error
 	s.b2c, err = b2.Authorize(s.conf.B2KeyID, s.conf.B2Key)
+	s.b2c.AutoRenew = true
 	return err
 }
 
@@ -80,6 +81,13 @@ func errconv(w http.ResponseWriter, err error) {
 	log.Printf("error: %s", err)
 	w.WriteHeader(500)
 	io.WriteString(w, "internal server error")
+}
+
+func is404(err error) bool {
+	if b2err, ok := err.(*b2.Error); ok {
+		return b2err.Status == 404
+	}
+	return false
 }
 
 func sethdr(w http.ResponseWriter, info *cacheinfo) {
@@ -170,6 +178,11 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		// can be forwarded directly to B2 (in principle...)
 		f, err := s.b2c.GetID(info.info.ID)
 		if err != nil {
+			// if this file was deleted from underneath us,
+			// evict the associated metadata from the cache now
+			if is404(err) {
+				s.meta.evict(&info)
+			}
 			errconv(w, err)
 			return
 		}

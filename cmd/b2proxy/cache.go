@@ -99,6 +99,16 @@ func (t *table) get(name string, out *cacheinfo) bool {
 	return ok
 }
 
+func (t *table) evict(info *cacheinfo) {
+	h := t.bucket(info.info.Name)
+	h.lock.Lock()
+	e, ok := h.entries[info.info.Name]
+	if ok && e.info.ID == info.info.ID {
+		delete(h.entries, info.info.Name)
+	}
+	h.lock.Unlock()
+}
+
 // generate an ETag that represents the file ID,
 // but don't use the file version (or an unseeded hash of it),
 // since leaking the actual file ID might be problematic
