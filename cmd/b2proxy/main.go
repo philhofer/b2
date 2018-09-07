@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -130,10 +131,25 @@ func (s *server) earlyOut(w http.ResponseWriter, headers http.Header, info *cach
 	return false
 }
 
+func (s *server) list(w http.ResponseWriter) {
+	fis := s.meta.sort()
+	w.Header().Set("Content-Type", "text/plain")
+	for i := range fis {
+		f := fis[i]
+		fmt.Fprintf(w, "%s %s %d %s\n", f.Name, f.ContentType, f.Size, f.Created())
+	}
+}
+
 func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	defer req.Body.Close()
-	if len(req.URL.Path) <= 1 { // ?
-		w.WriteHeader(http.StatusNotFound)
+	if req.URL.Path == "/" {
+		if req.Method != "GET" {
+			w.Header()["Allow"] = []string{"GET"}
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		// this is a list request
+		s.list(w)
 		return
 	}
 	if req.URL.Path[0] == '/' {

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,22 @@ func init() {
 	}
 	seed0 = binary.LittleEndian.Uint64(buf[:8])
 	seed1 = binary.LittleEndian.Uint64(buf[8:])
+}
+
+func (t *table) sort() []*b2.FileInfo {
+	var out []*b2.FileInfo
+	for i := range t.toplevel {
+		h := &t.toplevel[i]
+		h.lock.Lock()
+		for _, v := range h.entries {
+			out = append(out, &v.info)
+		}
+		h.lock.Unlock()
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Name < out[j].Name
+	})
+	return out
 }
 
 func (t *table) bucket(name string) *hbucket {
