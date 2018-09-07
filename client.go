@@ -336,7 +336,7 @@ type File struct {
 // make a download GET request to the given URI
 func (c *Client) get(uri, query string) (*File, error) {
 again:
-	if c.Cap != 0 && !c.has(CapReadFiles) {
+	if !c.has(CapReadFiles) {
 		return nil, fmt.Errorf("capabilities %q insufficient for reading files", c.Cap.String())
 	}
 	req := &http.Request{
@@ -428,6 +428,9 @@ type Bucket struct {
 // Buckets lists all of the buckets in the account matching the given type(s).
 // If no types are given, all buckets are returned.
 func (c *Client) Buckets(types ...string) ([]Bucket, error) {
+	if !c.has(CapListBuckets) {
+		return nil, fmt.Errorf("cap %q cannot list buckets", c.Cap.String())
+	}
 	if len(types) == 0 {
 		types = []string{"allPrivate", "allPublic", "snapshot"}
 	}
@@ -450,6 +453,9 @@ func (c *Client) Buckets(types ...string) ([]Bucket, error) {
 // prefix (lexographically) to continue listing from. If there
 // are no more files left to be listed, "" is returned as the next prefix.
 func (c *Client) ListBucket(bucket *Bucket, start string, max int) ([]FileInfo, string, error) {
+	if !c.has(CapListFiles) {
+		return nil, "", fmt.Errorf("cap %q cannot list files", c.Cap.String())
+	}
 	// This API doesn't support more than 10000 entries
 	if max > 10000 || max < 0 {
 		max = 10000
