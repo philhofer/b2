@@ -64,6 +64,7 @@ func (s *server) options(req *http.Request, w http.ResponseWriter) {
 	h.Set("Access-Control-Max-Age", "86400")
 	h["Access-Control-Allow-Methods"] = origins
 	h["Access-Control-Allow-Methods"] = []string{"GET", "HEAD"}
+	h["Accept-Ranges"] = []string{"none"}
 	w.WriteHeader(200)
 }
 
@@ -136,6 +137,12 @@ func (s *server) earlyOut(w http.ResponseWriter, headers http.Header, info *cach
 			return true
 		}
 	}
+	rangehdr := headers.Get("Range")
+	if rangehdr == "" {
+		// TODO: range headers aren't supported yet
+		w.WriteHeader(416)
+		return true
+	}
 	return false
 }
 
@@ -188,6 +195,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		defer f.Body.Close()
 		sethdr(w, &info)
+		w.Header().Set("Accept-Ranges", "none")
 		w.WriteHeader(200)
 		io.Copy(w, f.Body)
 	case "HEAD":
@@ -195,6 +203,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		sethdr(w, &info)
+		w.Header().Set("Accept-Ranges", "none")
 		w.WriteHeader(200)
 	case "OPTIONS":
 		s.options(req, w)
