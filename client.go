@@ -108,6 +108,18 @@ func (c *Capabilities) UnmarshalJSON(buf []byte) error {
 	return nil
 }
 
+func checkURL(text string) error {
+	u, err := url.Parse(text)
+	if err != nil {
+		return err
+	}
+	// refuse obviously insecure schemes
+	if u.Scheme != "https" {
+		return fmt.Errorf("unsupported URL scheme %q", u.Scheme)
+	}
+	return nil
+}
+
 // Client represents a client to the Backblaze b2 API.
 // Typically, a client should be constructed using Authorize().
 type Client struct {
@@ -190,6 +202,15 @@ func Authorize(keyID, key string) (*Client, error) {
 	err = json.NewDecoder(res.Body).Decode(&val)
 	if err != nil {
 		return nil, err
+	}
+
+	err = checkURL(val.URL)
+	if err != nil {
+		return nil, fmt.Errorf("b2: refusing bad api URL %q %s", val.URL, err)
+	}
+	err = checkURL(val.Download)
+	if err != nil {
+		return nil, fmt.Errorf("b2: refusing bad download URL %q %s", val.Download, err)
 	}
 
 	c := &Client{
