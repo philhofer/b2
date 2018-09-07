@@ -199,7 +199,7 @@ func main() {
 
 	log.Println("downloading and indexing metadata...")
 	if err := s.populate(); err != nil {
-		log.Fatal("couldn't fill metadata cache: %s", err)
+		log.Fatalf("couldn't fill metadata cache: %s", err)
 	}
 
 	log.Printf("beginning server on %s", s.conf.LocalAddress)
