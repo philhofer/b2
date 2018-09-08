@@ -124,19 +124,14 @@ func checkURL(text string) (string, error) {
 // Client represents a client to the Backblaze b2 API.
 // Typically, a client should be constructed using Authorize().
 type Client struct {
+	Key       *Key
 	AccountID string
 	AuthToken string
-	KeyID     string
-	Key       string
 
 	Host struct {
 		API      string
 		Download string
 	}
-	// Cap is the set of capabilities associated
-	// with the current AuthToken. As a special case,
-	// a zero Cap means unknown capabilities.
-	Cap Capabilities
 
 	// PartSize is the recommended part size for
 	// file uploads.
@@ -170,8 +165,11 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("b2 %s: %s (code %d, %q)", e.Op, e.Message, e.Status, e.Code)
 }
 
-func do(op string, req *http.Request) (*http.Response, error) {
-	res, err := http.DefaultClient.Do(req)
+func do(cl *http.Client, op string, req *http.Request) (*http.Response, error) {
+	if cl == nil {
+		cl = http.DefaultClient
+	}
+	res, err := cl.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -188,54 +186,74 @@ func do(op string, req *http.Request) (*http.Response, error) {
 // Authorize returns a Client that can be used for subsequent operations.
 // This call assumes the caller has already obtained a B2 app key through
 // some other means.
-func Authorize(keyID, key string) (*Client, error) {
+// The only fields in 'k' that are required are k.ID and k.Value.
+// Other fields are ignored when constructing the client.
+func (k *Key) Authorize(cl *http.Client) (*Client, error) {
+	out := new(Client)
+	err := k.authorize(cl, out)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (k *Key) authorize(cl *http.Client, dst *Client) error {
+	if k.Value == "" {
+		return fmt.Errorf("cannot Authorize() key with empty value")
+	}
 	req, err := http.NewRequest("GET", "https://api.backblazeb2.com/b2api/v1/b2_authorize_account", nil)
 	if err != nil {
 		panic(err)
 	}
-	req.SetBasicAuth(keyID, key)
-	res, err := do("b2_authorize_account", req)
+	req.SetBasicAuth(k.ID, k.Value)
+	res, err := do(cl, "b2_authorize_account", req)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer res.Body.Close()
 	val := struct {
-		ID          string       `json:"accountId"`
-		Auth        string       `json:"authorizationToken"`
-		Cap         Capabilities `json:"capabilities"`
-		URL         string       `json:"apiUrl"`
-		Download    string       `json:"downloadUrl"`
-		PartSize    int64        `json:"recommendedPartSize"`
-		MinPartSize int64        `json:"absoluteMinimumPartSize"`
+		ID      string `json:"accountId"`
+		Auth    string `json:"authorizationToken"`
+		Allowed struct {
+			Cap        Capabilities `json:"capabilities"`
+			BucketID   string       `json:"bucketId"`
+			BucketName string       `json:"bucketName"`
+			Prefix     string       `json:"namePrefix"`
+		} `json:"allowed"`
+		URL         string `json:"apiUrl"`
+		Download    string `json:"downloadUrl"`
+		PartSize    int64  `json:"recommendedPartSize"`
+		MinPartSize int64  `json:"absoluteMinimumPartSize"`
 	}{}
 
 	err = json.NewDecoder(res.Body).Decode(&val)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	c := &Client{
-		AccountID:   val.ID,
-		KeyID:       keyID,
-		Key:         key,
-		AuthToken:   val.Auth,
-		Cap:         val.Cap,
-		PartSize:    val.PartSize,
-		MinPartSize: val.MinPartSize,
-		Client:      http.DefaultClient,
-	}
+	dst.Key = k
+	k.Cap = val.Allowed.Cap
+	k.AccountID = val.ID
+	k.OnlyBucket = val.Allowed.BucketName
+	k.OnlyPrefix = val.Allowed.Prefix
+	dst.AccountID = val.ID
+	dst.AuthToken = val.Auth
+	dst.PartSize = val.PartSize
+	dst.MinPartSize = val.MinPartSize
+	dst.Client = cl
+
 	var host string
 	host, err = checkURL(val.URL)
 	if err != nil {
-		return nil, fmt.Errorf("refusing bad api url %q", val.URL)
+		return fmt.Errorf("refusing bad api url %q", val.URL)
 	}
-	c.Host.API = host
+	dst.Host.API = host
 	host, err = checkURL(val.Download)
 	if err != nil {
-		return nil, fmt.Errorf("refusing bad download url %q", val.Download)
+		return fmt.Errorf("refusing bad download url %q", val.Download)
 	}
-	c.Host.Download = host
-	return c, nil
+	dst.Host.Download = host
+	return nil
 }
 
 func (c *Client) http() *http.Client {
@@ -267,7 +285,7 @@ func (c *Client) apireq(method, path string, body interface{}) *http.Request {
 }
 
 func (c *Client) has(cap Capabilities) bool {
-	return c.Cap&cap == cap
+	return c.Key.Cap&cap == cap
 }
 
 func (c *Client) renew(inerr *Error, code int) error {
@@ -278,12 +296,7 @@ func (c *Client) renew(inerr *Error, code int) error {
 		inerr.Code != "bad_auth_token" {
 		return inerr
 	}
-	nc, err := Authorize(c.KeyID, c.Key)
-	if err != nil {
-		return err
-	}
-	*c = *nc
-	return nil
+	return c.Key.authorize(c.Client, c)
 }
 
 func (c *Client) api(op string, body, res interface{}) error {
@@ -337,7 +350,7 @@ type File struct {
 func (c *Client) get(uri, query string) (*File, error) {
 again:
 	if !c.has(CapReadFiles) {
-		return nil, fmt.Errorf("capabilities %q insufficient for reading files", c.Cap.String())
+		return nil, fmt.Errorf("capabilities %q insufficient for reading files", c.Key.Cap.String())
 	}
 	req := &http.Request{
 		Method: "GET",
@@ -429,7 +442,7 @@ type Bucket struct {
 // If no types are given, all buckets are returned.
 func (c *Client) Buckets(types ...string) ([]Bucket, error) {
 	if !c.has(CapListBuckets) {
-		return nil, fmt.Errorf("cap %q cannot list buckets", c.Cap.String())
+		return nil, fmt.Errorf("cap %q cannot list buckets", c.Key.Cap.String())
 	}
 	if len(types) == 0 {
 		types = []string{"allPrivate", "allPublic", "snapshot"}
@@ -454,7 +467,7 @@ func (c *Client) Buckets(types ...string) ([]Bucket, error) {
 // are no more files left to be listed, "" is returned as the next prefix.
 func (c *Client) ListBucket(bucket *Bucket, start string, max int) ([]FileInfo, string, error) {
 	if !c.has(CapListFiles) {
-		return nil, "", fmt.Errorf("cap %q cannot list files", c.Cap.String())
+		return nil, "", fmt.Errorf("cap %q cannot list files", c.Key.Cap.String())
 	}
 	// This API doesn't support more than 10000 entries
 	if max > 10000 || max < 0 {
@@ -476,4 +489,77 @@ func (c *Client) ListBucket(bucket *Bucket, start string, max int) ([]FileInfo, 
 		next = *res.Next
 	}
 	return res.Files, next, nil
+}
+
+type Key struct {
+	// Cap is the set of capabilites for the key
+	Cap Capabilities `json:"capabilities"`
+	// ID is b2's internal ID for the key
+	ID string `json:"applicationKeyId"`
+	// Name is the user-specified name for the key.
+	// A name does not necessarily uniquely specify
+	// a key; only an ID does.
+	Name string `json:"keyName"`
+	// Value is the actual value of the key.
+	// Some APIs (ListKeys) do not return
+	// the value of the key, so this field
+	// may be empty depending upon how the
+	// Key was constructed.
+	Value string `json:"-"`
+	// AccountID is the ID of the parent account of this key
+	AccountID string `json:"accountId"`
+	// RawExpires is the time (in unix time) at which
+	// this key expires. A value of zero indicates
+	// that the key does not have an expiration time.
+	RawExpires int64 `json:"expirationTimestamp,omitempty"`
+	// OnlyBucket, if not an empty string,
+	// is the only bucket that this key
+	// has permission to access.
+	OnlyBucket string `json:"bucketId,omitempty"`
+	// OnlyPrefix, if not an empty string,
+	// indicates that this key can only
+	// access files with names that have
+	// this prefix.
+	OnlyPrefix string `json:"namePrefix,omitempty"`
+}
+
+func (k *Key) Expires() time.Time {
+	return time.Unix(k.RawExpires, 0)
+}
+
+// ListKeys lists the keys associated with the account.
+// (The client must have the CapListKeys capability.)
+// If 'max' is greater than zero, it specifies the maximum
+// number of keys to return. If 'start' is not "", it specifies
+// the key at which to start listing (lexicographically).
+// The returned values are the list of keys and the next key
+// to start listing from (if the complete list of keys
+// was not returned).
+func (c *Client) ListKeys(start string, max int) ([]Key, string, error) {
+	if !c.has(CapListKeys) {
+		return nil, "", fmt.Errorf("cap %q cannot list keys", c.Key.Cap.String())
+	}
+	if max < 0 {
+		max = 0
+	} else if max > 10000 {
+		max = 10000
+	}
+	req := struct {
+		ID    string `json:"accountId"`
+		Count int    `json:"maxKeyCount,omitempty"`
+		Start string `json:"startApplicationKeyId,omitempty"`
+	}{
+		ID:    c.AccountID,
+		Count: max,
+		Start: start,
+	}
+	res := struct {
+		Keys []Key  `json:"keys"`
+		Next string `json:"nextApplicationKeyId"`
+	}{}
+	err := c.api("b2_list_keys", &req, &res)
+	if err != nil {
+		return nil, "", err
+	}
+	return res.Keys, res.Next, nil
 }

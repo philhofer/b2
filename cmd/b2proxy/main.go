@@ -30,7 +30,10 @@ type server struct {
 
 func (s *server) auth() error {
 	var err error
-	s.b2c, err = b2.Authorize(s.conf.B2KeyID, s.conf.B2Key)
+	s.b2c, err = (&b2.Key{
+		ID: s.conf.B2KeyID,
+		Value: s.conf.B2Key,
+	}).Authorize(nil)
 	s.b2c.AutoRenew = true
 	return err
 }

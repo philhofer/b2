@@ -43,7 +43,7 @@ func TestHappyCase(t *testing.T) {
 			"accountId": "the-id",
 			"apiUrl": "https://api-host.api-sub.backblaze.com",
 			"downloadUrl": "https://data-host.data-sub.backblaze.com",
-			"capabilities": ["listBuckets","readFiles","writeFiles"],
+			"allowed": {"capabilities": ["listBuckets","readFiles","writeFiles"]},
 			"authorizationToken": "the-auth-token"
 		}`)
 		return &http.Response{
@@ -53,7 +53,7 @@ func TestHappyCase(t *testing.T) {
 	}
 	http.DefaultClient.Transport = transport(rt)
 
-	client, err := Authorize(wantuser, wantpass)
+	client, err := (&Key{ID: wantuser, Value: wantpass}).Authorize(nil)
 	if err != nil {
 		t.Errorf("authorize: %s", err)
 	}
@@ -69,8 +69,8 @@ func TestHappyCase(t *testing.T) {
 	if client.Host.Download != "data-host.data-sub.backblaze.com" {
 		t.Errorf("bad download url: %s", client.Host.Download)
 	}
-	if client.Cap != CapListBuckets|CapReadFiles|CapWriteFiles {
-		t.Errorf("bad capabilities: %v", client.Cap)
+	if client.Key.Cap != CapListBuckets|CapReadFiles|CapWriteFiles {
+		t.Errorf("bad capabilities: %v", client.Key.Cap)
 	}
 
 	rt = func(req *http.Request) (*http.Response, error) {
