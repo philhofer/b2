@@ -33,8 +33,11 @@ func (s *server) auth() error {
 		ID:    s.conf.B2KeyID,
 		Value: s.conf.B2Key,
 	}).Authorize(nil)
+	if err != nil {
+		return err
+	}
 	s.b2c.AutoRenew = true
-	return err
+	return nil
 }
 
 func (s *server) allowsOrigin(origin string) bool {
@@ -53,6 +56,9 @@ func (s *server) allowsOrigin(origin string) bool {
 func (s *server) options(req *http.Request, w http.ResponseWriter) {
 	origin := req.Header.Get("Origin")
 	if !s.allowsOrigin(origin) {
+		// If this origin isn't allowed,
+		// avoid leaking whether or not
+		// we have an object at this path.
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
