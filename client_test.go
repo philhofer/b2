@@ -1,13 +1,48 @@
 package b2
 
 import (
+	"encoding/json"
 	"io/ioutil"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestCapabilitesText(t *testing.T) {
+	tbl := []struct {
+		cap Capabilities
+		str string
+	}{
+		{CapReadFiles, "readFiles"},
+		{CapReadFiles | CapWriteFiles, "readFiles,writeFiles"},
+		{CapListKeys | CapWriteKeys | CapListBuckets | CapReadFiles | CapWriteFiles,
+			"listKeys,writeKeys,listBuckets,readFiles,writeFiles"},
+	}
+
+	for i := range tbl {
+		tc := &tbl[i]
+		out := tc.cap.String()
+		if out != tc.str {
+			t.Errorf("want %q, got %q", tc.str, out)
+		}
+		buf, err := json.Marshal(tc.cap)
+		if err != nil {
+			t.Errorf("failed to marshal %q: %s", tc.str, err)
+		}
+		var sep []string
+		err = json.Unmarshal(buf, &sep)
+		if err != nil {
+			t.Errorf("couldn't unmarshal %s %s", buf, err)
+		}
+		csep := strings.Split(out, ",")
+		if !reflect.DeepEqual(sep, csep) {
+			t.Errorf("%v not equal to %v", sep, csep)
+		}
+	}
+}
 
 type transport func(*http.Request) (*http.Response, error)
 
@@ -86,8 +121,8 @@ func TestHappyCase(t *testing.T) {
 		if req.Header.Get("Authorization") != "the-auth-token" {
 			t.Error("missing auth token")
 		}
-		retbody := strings.NewReader(`{"buckets":
-			[{"bucketId":"bucket-id","bucketName":"bucket-name","bucketType":"allPrivate"}]
+		retbody := strings.NewReader(`{
+			"buckets": [{"bucketId":"bucket-id","bucketName":"bucket-name","bucketType":"allPrivate"}]
 		}`)
 		return &http.Response{
 			Body:       ioutil.NopCloser(retbody),

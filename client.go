@@ -56,14 +56,26 @@ func init() {
 	}
 }
 
-func (c *Capabilities) write(w io.Writer) {
+type buffer interface {
+	io.Writer
+	io.ByteWriter
+	WriteString(string) (int, error)
+}
+
+func (c *Capabilities) write(w buffer, quote bool) {
 	written := 0
 	for i := range captable {
 		if *c&captable[i].cap != 0 {
 			if written != 0 {
-				io.WriteString(w, ",")
+				w.WriteByte(',')
 			}
-			io.WriteString(w, captable[i].name)
+			if quote {
+				w.WriteByte('"')
+			}
+			w.WriteString(captable[i].name)
+			if quote {
+				w.WriteByte('"')
+			}
 			written++
 		}
 	}
@@ -79,15 +91,31 @@ func (c *Capabilities) String() string {
 		return "(unknown)"
 	}
 	var str strings.Builder
-	c.write(&str)
+	c.write(&str, false)
 	return str.String()
 }
 
+// ParseCapabilities parses a comma-separated list
+// of capabilities.
+func ParseCapabilities(s string) (Capabilities, error) {
+	list := strings.Split(s, ",")
+	c := Capabilities(0)
+	for i := range list {
+		cs := list[i]
+		if mask, ok := str2cap[cs]; ok {
+			c |= mask
+		} else {
+			return 0, fmt.Errorf("bad cap string %q", cs)
+		}
+	}
+	return c, nil
+}
+
 // MarshalJSON implements json.Marshaler
-func (c *Capabilities) MarshalJSON() ([]byte, error) {
+func (c Capabilities) MarshalJSON() ([]byte, error) {
 	var buf bytes.Buffer
 	buf.WriteByte('[')
-	c.write(&buf)
+	c.write(&buf, true)
 	buf.WriteByte(']')
 	return buf.Bytes(), nil
 }
@@ -505,7 +533,7 @@ type Key struct {
 	// the value of the key, so this field
 	// may be empty depending upon how the
 	// Key was constructed.
-	Value string `json:"-"`
+	Value string `json:"applicationKey"`
 	// AccountID is the ID of the parent account of this key
 	AccountID string `json:"accountId"`
 	// RawExpires is the time (in unix time) at which
@@ -562,4 +590,36 @@ func (c *Client) ListKeys(start string, max int) ([]Key, string, error) {
 		return nil, "", err
 	}
 	return res.Keys, res.Next, nil
+}
+
+// NewKey creates a new key.
+// key.Name, key.Cap, key.OnlyBucket, and key.OnlyPrefix
+// are used to identify the key name, capabilities,
+// and bucket and filename restrictions, respectively.
+// If 'valid' is non-zero, it identifies how long
+// the key should remain valid.
+// If NewKey returns without an error, then 'key'
+// can be used to construct a client with the new
+// capabilities with (*Key).Authorize(...)
+func (c *Client) NewKey(key *Key, valid time.Duration) error {
+	if !c.has(CapWriteKeys) {
+		return fmt.Errorf("cap %q cannot create keys", c.Key.Cap.String())
+	}
+	req := struct {
+		ID     string       `json:"accountId"`
+		Cap    Capabilities `json:"capabilities"`
+		Name   string       `json:"keyName"`
+		Valid  int64        `json:"validDurationInSeconds,omitempty"`
+		Bucket string       `json:"bucketId,omitempty"`
+		Prefix string       `json:"namePrefix,omitempty"`
+	}{
+		ID:     c.Key.AccountID,
+		Cap:    key.Cap,
+		Name:   key.Name,
+		Valid:  int64(valid / time.Second),
+		Bucket: key.OnlyBucket,
+		Prefix: key.OnlyPrefix,
+	}
+
+	return c.api("b2_create_key", &req, key)
 }

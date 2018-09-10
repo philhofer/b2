@@ -137,13 +137,25 @@ func fiheader(fi *b2.FileInfo) [][2]string {
 }
 
 func (s *server) loadBucket() (*b2.Bucket, error) {
-	if s.bucketID != "" {
+	if s.conf.BucketID != "" {
 		return &b2.Bucket{
-			ID:   s.bucketID,
+			ID:   s.conf.BucketID,
 			Name: s.conf.Bucket,
 		}, nil
 	}
 
+	// Weird B2 idiosyncracy:
+	// We want to list the named bucket
+	// in the configuration, but that requires
+	// a bucket ID, and the only way to get that
+	// when you just have a bucket name is
+	// to list the buckets and match against
+	// the name. As a consequence, if the config
+	// doesn't contain the bucket ID, we need
+	// CapListBuckets.
+	if s.b2c.Key.Cap&b2.CapListBuckets == 0 {
+		return nil, fmt.Errorf("bucket name %q provided w/o ID; need CapListBuckets to find bucket ID", s.conf.Bucket)
+	}
 	buckets, err := s.b2c.Buckets()
 	if err != nil {
 		return nil, err
@@ -151,11 +163,11 @@ func (s *server) loadBucket() (*b2.Bucket, error) {
 
 	for i := range buckets {
 		if buckets[i].Name == s.conf.Bucket {
-			s.bucketID = buckets[i].ID
+			s.conf.BucketID = buckets[i].ID
 			return &buckets[i], nil
 		}
 	}
-	return nil, fmt.Errorf("no bucket %q", s.conf.Bucket)
+	return nil, fmt.Errorf("no such bucket %q", s.conf.Bucket)
 }
 
 // populate updates the metadata cache

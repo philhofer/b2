@@ -21,17 +21,16 @@ func init() {
 }
 
 type server struct {
-	b2c      *b2.Client
-	conf     Config
-	meta     table
-	host     string // host part of Config.LocalAddress
-	bucketID string // ID of conf.Bucket
+	b2c  *b2.Client
+	conf Config
+	meta table
+	host string // host part of Config.LocalAddress
 }
 
 func (s *server) auth() error {
 	var err error
 	s.b2c, err = (&b2.Key{
-		ID: s.conf.B2KeyID,
+		ID:    s.conf.B2KeyID,
 		Value: s.conf.B2Key,
 	}).Authorize(nil)
 	s.b2c.AutoRenew = true
@@ -149,9 +148,15 @@ func (s *server) earlyOut(w http.ResponseWriter, headers http.Header, info *cach
 	return false
 }
 
-func (s *server) list(w http.ResponseWriter) {
+func (s *server) list(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "GET" {
+		w.Header().Set("Allow", "GET")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	fis := s.meta.sort()
 	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(200)
 	for i := range fis {
 		f := fis[i]
 		fmt.Fprintf(w, "%s %s %d %s\n", f.Name, f.ContentType, f.Size, f.Created())
@@ -161,14 +166,13 @@ func (s *server) list(w http.ResponseWriter) {
 func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	defer req.Body.Close()
 	if req.URL.Path == "/" {
-		if req.Method != "GET" {
-			w.Header()["Allow"] = []string{"GET"}
-			w.WriteHeader(http.StatusMethodNotAllowed)
+		if s.conf.RewriteRoot != "" {
+			req.URL.Path = s.conf.RewriteRoot
+		} else {
+			// this is a list request
+			s.list(w, req)
 			return
 		}
-		// this is a list request
-		s.list(w)
-		return
 	}
 	if req.URL.Path[0] == '/' {
 		req.URL.Path = req.URL.Path[1:]
