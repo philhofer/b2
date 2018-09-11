@@ -509,7 +509,7 @@ again:
 // It is the caller's responsibility to close File.Body
 // after using the data.
 func (c *Client) Get(bucket, name string) (*File, error) {
-	f, err := c.get("/file/"+bucket+"/"+name, "")
+	f, err := c.get("/file/"+url.PathEscape(bucket)+"/"+url.PathEscape(name), "")
 	if f != nil {
 		f.Bucket = bucket
 	}
