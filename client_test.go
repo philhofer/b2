@@ -92,17 +92,17 @@ func TestHappyCase(t *testing.T) {
 	if err != nil {
 		t.Errorf("authorize: %s", err)
 	}
-	if client.AccountID != "the-id" {
-		t.Errorf("bad account id: %s", client.AccountID)
+	if client.Key.AccountID != "the-id" {
+		t.Errorf("bad account id: %s", client.Key.AccountID)
 	}
-	if client.AuthToken != "the-auth-token" {
+	if client.mut.auth != "the-auth-token" {
 		t.Error("bad auth token")
 	}
-	if client.Host.API != "api-host.api-sub.backblaze.com" {
-		t.Errorf("bad api url: %s", client.Host.API)
+	if client.mut.api != "api-host.api-sub.backblaze.com" {
+		t.Errorf("bad api url: %s", client.mut.api)
 	}
-	if client.Host.Download != "data-host.data-sub.backblaze.com" {
-		t.Errorf("bad download url: %s", client.Host.Download)
+	if client.mut.dl != "data-host.data-sub.backblaze.com" {
+		t.Errorf("bad download url: %s", client.mut.dl)
 	}
 	if client.Key.Cap != CapListBuckets|CapReadFiles|CapWriteFiles {
 		t.Errorf("bad capabilities: %v", client.Key.Cap)
@@ -149,12 +149,17 @@ func TestHappyCase(t *testing.T) {
 		t.Errorf("unexpected bucket type %q", bucket.Type)
 	}
 
+	wantauth := client.mut.auth
+	wanthost := client.mut.dl
 	now := time.Now().Unix()
 	rt = func(req *http.Request) (*http.Response, error) {
 		if req.URL.Path != "/file/"+bucket.Name+"/file-name" {
 			t.Errorf("unexpected path: %s", req.URL.Path)
 		}
-		if req.Header.Get("Authorization") != "the-auth-token" {
+		if req.URL.Host != wanthost {
+			t.Error("bad host in request", req.URL.Host, wanthost)
+		}
+		if req.Header.Get("Authorization") != wantauth {
 			t.Error("missing authorization")
 		}
 		h := make(http.Header)
@@ -188,6 +193,68 @@ func TestHappyCase(t *testing.T) {
 	}
 	if f.ContentType != "text/plain" {
 		t.Error("unexpected content type", f.ContentType)
+	}
+	f.Body.Close()
+
+	// test the re-authorization case:
+	// we try to get a file, which causes a 401 to be
+	// returned, which should trigger a re-auth and
+	// another GET of the file with the new auth token
+	client.AutoRenew = true
+	realget := rt
+	expire := func(req *http.Request) (*http.Response, error) {
+		if req.Method != "GET" {
+			t.Error("unexpected request method", req.Method)
+		}
+		if req.Header.Get("Authorization") != wantauth {
+			t.Error("unexpected request Authorization header")
+		}
+		if req.URL.Host != wanthost {
+			t.Error("bad host in request")
+		}
+		return &http.Response{
+			Body:       ioutil.NopCloser(strings.NewReader(`{"code": "bad_auth_token"}`)),
+			StatusCode: 401,
+		}, nil
+	}
+	auth := func(req *http.Request) (*http.Response, error) {
+		// it's not clear from B2's documentation if we should
+		// re-authorize using the old API url, or if we should
+		// authorize like the initial authorization...
+		// empirically, this seems to work
+		if req.URL.Host != "api.backblazeb2.com" {
+			t.Error("request not to api host...?", req.URL.Host)
+		}
+		wantauth = "a-second-auth-token"
+		wanthost = "other-host.dl.backblaze.com"
+		return &http.Response{
+			Body: ioutil.NopCloser(strings.NewReader(`{
+				"accountId": "account-id",
+				"downloadUrl": "https://other-host.dl.backblaze.com",
+				"apiUrl": "https://other-host.api.backblaze.com",
+				"authorizationToken": "a-second-auth-token"
+			}`)),
+			StatusCode: 200,
+		}, nil
+	}
+
+	count := 0
+	http.DefaultClient.Transport = transport(func(req *http.Request) (*http.Response, error) {
+		c := count
+		count++
+		switch c {
+		case 0:
+			return expire(req)
+		case 1:
+			return auth(req)
+		default:
+			return realget(req)
+		}
+	})
+
+	f, err = client.Get(bucket.Name, "file-name")
+	if err != nil {
+		t.Fatal(err)
 	}
 	f.Body.Close()
 }

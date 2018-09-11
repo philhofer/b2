@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -150,33 +151,40 @@ func checkURL(text string) (string, error) {
 }
 
 // Client represents a client to the Backblaze b2 API.
+// It represents an authorization token associated with
+// a particular key.
+//
 // Typically, a client should be constructed using Authorize().
+// All of the methods on Client are safe to call concurrently.
 type Client struct {
-	Key       *Key
-	AccountID string
-	AuthToken string
-
-	Host struct {
-		API      string
-		Download string
+	// mutable fields; updated every time the
+	// auth token expires
+	mut struct {
+		sync.Mutex
+		sync.Cond
+		authorizing       bool
+		authcount         int32  // authorization sequence
+		api, dl           string // api and download hostnames
+		partsz, minpartsz int64  // part size, min part size
+		auth              string // current auth token
 	}
 
-	// PartSize is the recommended part size for
-	// file uploads.
-	PartSize int64
-
-	// MinPartSize is the smallest allowed part size
-	// for file uploads.
-	MinPartSize int64
+	// Key is the key currently being used by the Client.
+	// Users should treat this field as read-only.
+	Key Key
 
 	// Client is the http.Client used to make requests.
 	// If Client is nil, then http.DefaultClient is used.
+	// It is not safe to mutate this field with any
+	// other concurrent use of this struct.
 	Client *http.Client
 
 	// AutoRenew determines whether or not the client
 	// automatically fetches a new auth token when
 	// it receives a response that the auth token
-	// has expired.
+	// has expired. It is not safe to mutate this
+	// field concurrently with any other use of this
+	// struct.
 	AutoRenew bool
 }
 
@@ -218,14 +226,15 @@ func do(cl *http.Client, op string, req *http.Request) (*http.Response, error) {
 // Other fields are ignored when constructing the client.
 func (k *Key) Authorize(cl *http.Client) (*Client, error) {
 	out := new(Client)
-	err := k.authorize(cl, out)
+	out.mut.authorizing = true
+	err := k.authorize(cl, out, true)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (k *Key) authorize(cl *http.Client, dst *Client) error {
+func (k *Key) authorize(cl *http.Client, dst *Client, init bool) error {
 	if k.Value == "" {
 		return fmt.Errorf("cannot Authorize() key with empty value")
 	}
@@ -239,6 +248,7 @@ func (k *Key) authorize(cl *http.Client, dst *Client) error {
 		return err
 	}
 	defer res.Body.Close()
+
 	val := struct {
 		ID      string `json:"accountId"`
 		Auth    string `json:"authorizationToken"`
@@ -259,28 +269,39 @@ func (k *Key) authorize(cl *http.Client, dst *Client) error {
 		return err
 	}
 
-	dst.Key = k
-	k.Cap = val.Allowed.Cap
-	k.AccountID = val.ID
-	k.OnlyBucket = val.Allowed.BucketName
-	k.OnlyPrefix = val.Allowed.Prefix
-	dst.AccountID = val.ID
-	dst.AuthToken = val.Auth
-	dst.PartSize = val.PartSize
-	dst.MinPartSize = val.MinPartSize
-	dst.Client = cl
+	// client.Key is immutable after the first time
+	// we construct the client; the presumption here
+	// is that B2 keys do not have mutable capabilities/restrictions
+	if init {
+		k.Cap = val.Allowed.Cap
+		k.AccountID = val.ID
+		k.OnlyBucket = val.Allowed.BucketName
+		k.OnlyPrefix = val.Allowed.Prefix
+		dst.mut.Cond.L = &dst.mut.Mutex
+		dst.Key = *k
+		dst.Client = cl
+	}
 
-	var host string
-	host, err = checkURL(val.URL)
+	dst.mut.Lock()
+	defer dst.mut.Unlock()
+	dst.mut.authcount++
+	dst.mut.auth = val.Auth
+	dst.mut.partsz = val.PartSize
+	dst.mut.minpartsz = val.MinPartSize
+	if !dst.mut.authorizing {
+		panic("authorization race?")
+	}
+	dst.mut.authorizing = false
+	dst.mut.Broadcast()
+
+	dst.mut.api, err = checkURL(val.URL)
 	if err != nil {
 		return fmt.Errorf("refusing bad api url %q", val.URL)
 	}
-	dst.Host.API = host
-	host, err = checkURL(val.Download)
+	dst.mut.dl, err = checkURL(val.Download)
 	if err != nil {
 		return fmt.Errorf("refusing bad download url %q", val.Download)
 	}
-	dst.Host.Download = host
 	return nil
 }
 
@@ -291,15 +312,30 @@ func (c *Client) http() *http.Client {
 	return c.Client
 }
 
-func (c *Client) apireq(method, path string, body interface{}) *http.Request {
+func (c *Client) apiHost() string {
+	c.mut.Lock()
+	h := c.mut.api
+	c.mut.Unlock()
+	return h
+}
+
+func (c *Client) apireq(method, path string, body interface{}) (*http.Request, int32) {
 	buf, err := json.Marshal(body)
 	if err != nil {
 		panic(err)
 	}
+	c.mut.Lock()
+	for c.mut.authorizing {
+		c.mut.Wait()
+	}
+	auth := c.mut.auth
+	host := c.mut.api
+	seq := c.mut.authcount
+	c.mut.Unlock()
 	req := &http.Request{
 		URL: &url.URL{
 			Scheme: "https",
-			Host:   c.Host.API,
+			Host:   host,
 			Path:   path,
 		},
 		Header:        make(http.Header),
@@ -307,16 +343,16 @@ func (c *Client) apireq(method, path string, body interface{}) *http.Request {
 		Body:          ioutil.NopCloser(bytes.NewReader(buf)),
 		ContentLength: int64(len(buf)),
 	}
-	req.Header.Set("Authorization", c.AuthToken)
+	req.Header.Set("Authorization", auth)
 	req.Header.Set("Content-Type", "application/json")
-	return req
+	return req, seq
 }
 
 func (c *Client) has(cap Capabilities) bool {
 	return c.Key.Cap&cap == cap
 }
 
-func (c *Client) renew(inerr *Error, code int) error {
+func (c *Client) renew(inerr *Error, code int, seq int32) error {
 	if !c.AutoRenew || code != 401 {
 		return inerr
 	}
@@ -324,12 +360,31 @@ func (c *Client) renew(inerr *Error, code int) error {
 		inerr.Code != "bad_auth_token" {
 		return inerr
 	}
-	return c.Key.authorize(c.Client, c)
+	// the logic here gets a litte tricky, because
+	// we'd really like to avoid a 'thundering herd'
+	// of auth requests if a bunch of goroutines are using
+	// the client concurrently and the auth token expires;
+	// we limit the client to one auth request and force
+	// the other goroutines to wait for it to complete
+	c.mut.Lock()
+	if c.mut.authorizing {
+		for c.mut.authorizing {
+			c.mut.Wait()
+		}
+	} else if c.mut.authcount > seq {
+		// in the time we spent waiting for a response,
+		// another goroutine already got a new auth token
+		c.mut.Unlock()
+		return nil
+	}
+	c.mut.authorizing = true
+	c.mut.Unlock()
+	return c.Key.authorize(c.Client, c, false)
 }
 
 func (c *Client) api(op string, body, res interface{}) error {
 again:
-	req := c.apireq("POST", "/b2api/v1/"+op, body)
+	req, seq := c.apireq("POST", "/b2api/v1/"+op, body)
 	hres, err := c.http().Do(req)
 	if err != nil {
 		return err
@@ -339,7 +394,7 @@ again:
 	if hres.StatusCode != 200 {
 		e := &Error{Op: op}
 		d.Decode(e)
-		err = c.renew(e, hres.StatusCode)
+		err = c.renew(e, hres.StatusCode, seq)
 		if err == nil {
 			goto again
 		}
@@ -380,17 +435,25 @@ again:
 	if !c.has(CapReadFiles) {
 		return nil, fmt.Errorf("capabilities %q insufficient for reading files", c.Key.Cap.String())
 	}
+	c.mut.Lock()
+	for c.mut.authorizing {
+		c.mut.Wait()
+	}
+	seq := c.mut.authcount
+	auth := c.mut.auth
+	host := c.mut.dl
+	c.mut.Unlock()
 	req := &http.Request{
 		Method: "GET",
 		URL: &url.URL{
-			Host:     c.Host.Download,
+			Host:     host,
 			Path:     uri,
 			Scheme:   "https",
 			RawQuery: query,
 		},
 		Header: make(http.Header),
 	}
-	req.Header.Set("Authorization", c.AuthToken)
+	req.Header.Set("Authorization", auth)
 	res, err := c.http().Do(req)
 	if err != nil {
 		return nil, err
@@ -399,7 +462,7 @@ again:
 		e := &Error{Op: "GET " + req.URL.String(), Status: res.StatusCode}
 		json.NewDecoder(res.Body).Decode(e)
 		res.Body.Close()
-		err = c.renew(e, res.StatusCode)
+		err = c.renew(e, res.StatusCode, seq)
 		if err == nil {
 			goto again
 		}
@@ -478,7 +541,7 @@ func (c *Client) Buckets(types ...string) ([]Bucket, error) {
 	req := struct {
 		ID    string   `json:"accountId"`
 		Types []string `json:"bucketTypes"`
-	}{c.AccountID, types}
+	}{c.Key.AccountID, types}
 	res := struct {
 		Buckets []Bucket `json:"buckets"`
 	}{}
@@ -577,7 +640,7 @@ func (c *Client) ListKeys(start string, max int) ([]Key, string, error) {
 		Count int    `json:"maxKeyCount,omitempty"`
 		Start string `json:"startApplicationKeyId,omitempty"`
 	}{
-		ID:    c.AccountID,
+		ID:    c.Key.AccountID,
 		Count: max,
 		Start: start,
 	}
