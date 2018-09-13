@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -257,4 +258,82 @@ func TestHappyCase(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Body.Close()
+}
+
+func TestConcurrentReauth(t *testing.T) {
+	c := &Client{
+		Key: Key{
+			Cap:   (CapDeleteFiles << 1) - 1,
+			Value: "key-text",
+			ID:    "key-id",
+		},
+	}
+	c.mut.dl = "dl.backblaze.com"
+	c.mut.api = "api.backblaze.com"
+	c.mut.auth = "first-auth-token"
+
+	var (
+		gets  int32
+		auths int32
+	)
+
+	c.mut.Cond.L = &c.mut.Mutex
+	c.AutoRenew = true
+	c.Client = http.DefaultClient
+	c.Client.Transport = transport(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Host {
+		case "dl.backblaze.com":
+			atomic.AddInt32(&gets, 1)
+			// this is a regular get request
+			auth := req.Header.Get("Authorization")
+			if auth != "second-auth-token" {
+				return &http.Response{
+					StatusCode: 401,
+					Body: ioutil.NopCloser(strings.NewReader(`
+{"code": "bad_auth_token"}`)),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Body:       ioutil.NopCloser(strings.NewReader(`the body`)),
+			}, nil
+		case "api.backblaze.com":
+			t.Fatal("didn't expect any API requests...")
+		case "api.backblazeb2.com":
+			atomic.AddInt32(&auths, 1)
+			// missing some fields, but sufficient for this test...
+			return &http.Response{
+				StatusCode: 200,
+				Body: ioutil.NopCloser(strings.NewReader(`{
+					"authorizationToken": "second-auth-token",
+					"downloadUrl": "https://dl.backblaze.com",
+					"apiUrl": "https://api.backblaze.com"
+				}`)),
+			}, nil
+		default:
+			t.Fatal("bad host", req.URL.Host)
+		}
+		// unreachable
+		return nil, nil
+	})
+
+	n := 1000
+	res := make(chan error, 30)
+	for i := 0; i < n; i++ {
+		go func() {
+			f, err := c.Get("a-bucket", "a-file")
+			res <- err
+			if f != nil {
+				f.Body.Close()
+			}
+		}()
+	}
+	for i := 0; i < n; i++ {
+		err := <-res
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Logf("%d auths of %d", auths, n)
+	t.Logf("%d gets of %d", gets, n)
 }
