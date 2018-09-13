@@ -260,6 +260,10 @@ func TestHappyCase(t *testing.T) {
 	f.Body.Close()
 }
 
+// When an auth token expires, make sure
+// that there is only one request for a new
+// token, even if there are many concurrent
+// requests
 func TestConcurrentReauth(t *testing.T) {
 	c := &Client{
 		Key: Key{
@@ -333,6 +337,9 @@ func TestConcurrentReauth(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+	}
+	if auths != 1 {
+		t.Errorf("expected one auth but saw %d", auths)
 	}
 	t.Logf("%d auths of %d", auths, n)
 	t.Logf("%d gets of %d", gets, n)
