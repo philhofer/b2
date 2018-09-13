@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -291,12 +292,14 @@ func TestConcurrentReauth(t *testing.T) {
 			// this is a regular get request
 			auth := req.Header.Get("Authorization")
 			if auth != "second-auth-token" {
+				runtime.Gosched()
 				return &http.Response{
 					StatusCode: 401,
 					Body: ioutil.NopCloser(strings.NewReader(`
 {"code": "bad_auth_token"}`)),
 				}, nil
 			}
+			runtime.Gosched()
 			return &http.Response{
 				StatusCode: 200,
 				Body:       ioutil.NopCloser(strings.NewReader(`the body`)),
@@ -305,6 +308,7 @@ func TestConcurrentReauth(t *testing.T) {
 			t.Fatal("didn't expect any API requests...")
 		case "api.backblazeb2.com":
 			atomic.AddInt32(&auths, 1)
+			runtime.Gosched()
 			// missing some fields, but sufficient for this test...
 			return &http.Response{
 				StatusCode: 200,
