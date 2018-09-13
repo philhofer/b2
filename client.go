@@ -360,20 +360,14 @@ func (c *Client) renew(inerr *Error, code int, seq int32) error {
 		inerr.Code != "bad_auth_token" {
 		return inerr
 	}
-	// the logic here gets a litte tricky, because
-	// we'd really like to avoid a 'thundering herd'
-	// of auth requests if a bunch of goroutines are using
-	// the client concurrently and the auth token expires;
-	// we limit the client to one auth request and force
-	// the other goroutines to wait for it to complete
+	// if another goroutine got around to starting
+	// an authorization while this one was performing
+	// a request, then simply return and try the
+	// request again
+	// (the caller will have to wait until
+	// c.mut.authorizing is unset)
 	c.mut.Lock()
-	if c.mut.authorizing {
-		for c.mut.authorizing {
-			c.mut.Wait()
-		}
-	} else if c.mut.authcount > seq {
-		// in the time we spent waiting for a response,
-		// another goroutine already got a new auth token
+	if c.mut.authcount > seq || c.mut.authorizing {
 		c.mut.Unlock()
 		return nil
 	}
