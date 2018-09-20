@@ -150,6 +150,98 @@ func checkURL(text string) (string, error) {
 	return u.Host, nil
 }
 
+type debouncer struct {
+	sync.Mutex
+	sync.Cond
+	count  int32
+	locked bool
+}
+
+func (d *debouncer) init() {
+	d.Cond.L = &d.Mutex
+}
+
+// acquire the lock to read fields
+func (d *debouncer) rlock() int32 {
+	d.Lock()
+	for d.locked {
+		d.Wait()
+	}
+	return d.count
+}
+
+// release the read lock
+func (d *debouncer) runlock() {
+	d.Unlock()
+}
+
+// conditionally acquire the write lock
+// based on the staleness of a previous
+// read lock acquisition
+func (d *debouncer) acquire(n int32) bool {
+	d.Lock()
+	ok := false
+	if !d.locked && n == d.count {
+		d.locked = true
+		ok = true
+	}
+	d.Unlock()
+	return ok
+}
+
+// release the write lock
+func (d *debouncer) release() {
+	d.Lock()
+	if !d.locked {
+		panic("bad release()")
+	}
+	d.locked = false
+	d.count++
+	d.Broadcast()
+	d.Unlock()
+}
+
+type urlentry struct {
+	cached []struct {
+		url, auth string
+	}
+}
+
+type urlcache struct {
+	sync.Mutex
+	tbl map[string]*urlentry
+}
+
+func (u *urlcache) get(bucket string) (string, string, bool) {
+	u.Lock()
+	defer u.Unlock()
+	e, ok := u.tbl[bucket]
+	if !ok {
+		return "", "", false
+	}
+	l := len(e.cached)
+	if l > 0 {
+		c := &e.cached[l-1]
+		auth, url := c.auth, c.url
+		e.cached = e.cached[:l-1]
+		return url, auth, true
+	}
+	return "", "", false
+}
+
+func (u *urlcache) put(bucket, url, auth string) {
+	u.Lock()
+	defer u.Unlock()
+	e := u.tbl[bucket]
+	if e == nil {
+		e = new(urlentry)
+		u.tbl[bucket] = e
+	}
+	e.cached = append(e.cached, struct {
+		url, auth string
+	}{url, auth})
+}
+
 // Client represents a client to the Backblaze b2 API.
 // It represents an authorization token associated with
 // a particular key.
@@ -160,14 +252,19 @@ type Client struct {
 	// mutable fields; updated every time the
 	// auth token expires
 	mut struct {
-		sync.Mutex
-		sync.Cond
-		authorizing       bool
-		authcount         int32  // authorization sequence
+		debouncer
 		api, dl           string // api and download hostnames
 		partsz, minpartsz int64  // part size, min part size
 		auth              string // current auth token
 	}
+
+	// cache upload authorizations, since they
+	// can be re-used, and it saves a (slow!) round-trip
+	//
+	// the B2 documentation is unclear about whether or
+	// not concurrent uploads to a given url are safe (???)
+	// so they are pulled out of the cache when used
+	uploads urlcache
 
 	// Key is the key currently being used by the Client.
 	// Users should treat this field as read-only.
@@ -185,7 +282,19 @@ type Client struct {
 	// has expired. It is not safe to mutate this
 	// field concurrently with any other use of this
 	// struct.
+	// If AutoRenew is unset, then callers should
+	// expect to receive more error returns of
+	// type *b2.Error where (*b2.Error).Temporary()
+	// is true.
 	AutoRenew bool
+
+	// AutoRetry determines whether or not the
+	// client automatically retries requests
+	// that fail with a 408, 429, or 503 status code.
+	// For 429 responses, the client will sleep
+	// for the time indicated by the
+	// "Retry-After" header.
+	AutoRetry bool
 }
 
 // Error represents an error returned from the B2 API
@@ -194,6 +303,22 @@ type Error struct {
 	Status  int    `json:"status"`
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+// Temporary returns whether the operation that produced this
+// error would likely succeed if re-tried.
+func (e *Error) Temporary() bool {
+	switch e.Status {
+	case 408, 429, 503:
+		// TODO: figure out how to handle 429s more gracefully;
+		// we should respect the Retry-After reponse header
+		// if it is present...
+		return true
+	case 401:
+		return e.Code == "expired_auth_token" || e.Code == "bad_auth_token"
+	default:
+		return false
+	}
 }
 
 // Error implements the error interface
@@ -226,7 +351,7 @@ func do(cl *http.Client, op string, req *http.Request) (*http.Response, error) {
 // Other fields are ignored when constructing the client.
 func (k *Key) Authorize(cl *http.Client) (*Client, error) {
 	out := new(Client)
-	out.mut.authorizing = true
+	out.AutoRenew = true
 	err := k.authorize(cl, out, true)
 	if err != nil {
 		return nil, err
@@ -273,26 +398,20 @@ func (k *Key) authorize(cl *http.Client, dst *Client, init bool) error {
 	// we construct the client; the presumption here
 	// is that B2 keys do not have mutable capabilities/restrictions
 	if init {
+		dst.mut.init()
 		k.Cap = val.Allowed.Cap
 		k.AccountID = val.ID
 		k.OnlyBucket = val.Allowed.BucketName
 		k.OnlyPrefix = val.Allowed.Prefix
-		dst.mut.Cond.L = &dst.mut.Mutex
 		dst.Key = *k
 		dst.Client = cl
+	} else if !dst.mut.locked {
+		panic("race in authorize()")
 	}
 
-	dst.mut.Lock()
-	defer dst.mut.Unlock()
-	dst.mut.authcount++
 	dst.mut.auth = val.Auth
 	dst.mut.partsz = val.PartSize
 	dst.mut.minpartsz = val.MinPartSize
-	if !dst.mut.authorizing {
-		panic("authorization race?")
-	}
-	dst.mut.authorizing = false
-	dst.mut.Broadcast()
 
 	dst.mut.api, err = checkURL(val.URL)
 	if err != nil {
@@ -324,27 +443,27 @@ func (c *Client) apireq(method, path string, body interface{}) (*http.Request, i
 	if err != nil {
 		panic(err)
 	}
-	c.mut.Lock()
-	for c.mut.authorizing {
-		c.mut.Wait()
-	}
+	seq := c.mut.rlock()
 	auth := c.mut.auth
 	host := c.mut.api
-	seq := c.mut.authcount
-	c.mut.Unlock()
+	c.mut.runlock()
 	req := &http.Request{
 		URL: &url.URL{
 			Scheme: "https",
 			Host:   host,
 			Path:   path,
 		},
-		Header:        make(http.Header),
-		Method:        method,
-		Body:          ioutil.NopCloser(bytes.NewReader(buf)),
+		Header: make(http.Header),
+		Method: method,
+		Body:   ioutil.NopCloser(bytes.NewReader(buf)),
+		GetBody: func() (io.ReadCloser, error) {
+			return ioutil.NopCloser(bytes.NewReader(buf)), nil
+		},
 		ContentLength: int64(len(buf)),
 	}
 	req.Header.Set("Authorization", auth)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Length", strconv.FormatInt(int64(len(buf)), 10))
 	return req, seq
 }
 
@@ -352,28 +471,45 @@ func (c *Client) has(cap Capabilities) bool {
 	return c.Key.Cap&cap == cap
 }
 
-func (c *Client) renew(inerr *Error, code int, seq int32) error {
-	if !c.AutoRenew || code != 401 {
+func (c *Client) renew(res *http.Response, inerr *Error, seq int32) error {
+	if res.StatusCode != inerr.Status {
+		return fmt.Errorf("b2 misbehaving: json says code %d; HTTP says %d", inerr.Status, res.StatusCode)
+	}
+	if !inerr.Temporary() {
 		return inerr
 	}
-	if inerr.Code != "expired_auth_token" &&
-		inerr.Code != "bad_auth_token" {
+
+	// AutoRenew governs 401 handling;
+	// AutoRetry governs other temporaries
+	if inerr.Status == 401 {
+		if !c.AutoRenew {
+			return inerr
+		}
+	} else if !c.AutoRetry {
 		return inerr
+	}
+
+	if inerr.Status == 429 {
+		// try to honor 429 responses
+		// like the b2 documentation suggests...
+		str := res.Header.Get("Retry-After")
+		if str != "" {
+			sec, err := strconv.ParseInt(str, 64, 0)
+			if err == nil {
+				time.Sleep(time.Duration(sec) * time.Second)
+			}
+		}
 	}
 	// if another goroutine got around to starting
 	// an authorization while this one was performing
 	// a request, then simply return and try the
 	// request again
-	// (the caller will have to wait until
-	// c.mut.authorizing is unset)
-	c.mut.Lock()
-	if c.mut.authcount > seq || c.mut.authorizing {
-		c.mut.Unlock()
+	if !c.mut.acquire(seq) {
 		return nil
 	}
-	c.mut.authorizing = true
-	c.mut.Unlock()
-	return c.Key.authorize(c.Client, c, false)
+	err := c.Key.authorize(c.Client, c, false)
+	c.mut.release()
+	return err
 }
 
 func (c *Client) api(op string, body, res interface{}) error {
@@ -386,9 +522,9 @@ again:
 	defer hres.Body.Close()
 	d := json.NewDecoder(hres.Body)
 	if hres.StatusCode != 200 {
-		e := &Error{Op: op}
+		e := &Error{Op: op, Status: hres.StatusCode}
 		d.Decode(e)
-		err = c.renew(e, hres.StatusCode, seq)
+		err = c.renew(hres, e, seq)
 		if err == nil {
 			goto again
 		}
@@ -429,14 +565,10 @@ again:
 	if !c.has(CapReadFiles) {
 		return nil, fmt.Errorf("capabilities %q insufficient for reading files", c.Key.Cap.String())
 	}
-	c.mut.Lock()
-	for c.mut.authorizing {
-		c.mut.Wait()
-	}
-	seq := c.mut.authcount
+	seq := c.mut.rlock()
 	auth := c.mut.auth
 	host := c.mut.dl
-	c.mut.Unlock()
+	c.mut.runlock()
 	req := &http.Request{
 		Method: "GET",
 		URL: &url.URL{
@@ -456,7 +588,7 @@ again:
 		e := &Error{Op: "GET " + req.URL.String(), Status: res.StatusCode}
 		json.NewDecoder(res.Body).Decode(e)
 		res.Body.Close()
-		err = c.renew(e, res.StatusCode, seq)
+		err = c.renew(res, e, seq)
 		if err == nil {
 			goto again
 		}
@@ -576,6 +708,8 @@ func (c *Client) ListBucket(bucket *Bucket, start string, max int) ([]FileInfo, 
 	return res.Files, next, nil
 }
 
+// Key represents a B2 access key.
+// Keys are used to produce Clients.
 type Key struct {
 	// Cap is the set of capabilites for the key
 	Cap Capabilities `json:"capabilities"`
@@ -608,6 +742,9 @@ type Key struct {
 	OnlyPrefix string `json:"namePrefix,omitempty"`
 }
 
+// Expires returns when the key expires,
+// or the zero value of time.Time if
+// the key does not have an expiration date.
 func (k *Key) Expires() time.Time {
 	return time.Unix(k.RawExpires, 0)
 }
@@ -679,4 +816,141 @@ func (c *Client) NewKey(key *Key, valid time.Duration) error {
 	}
 
 	return c.api("b2_create_key", &req, key)
+}
+
+// acquire an upload url and auth token for a bucket
+func (c *Client) upload(bucketID string) (string, string, error) {
+	if !c.has(CapWriteFiles) {
+		return "", "", fmt.Errorf("cap %q cannot write files", c.Key.Cap.String())
+	}
+
+	// see if we can grab a recently-used
+	// upload authorization from the cache...
+	url, auth, ok := c.uploads.get(bucketID)
+	if ok {
+		return url, auth, nil
+	}
+
+	req := struct {
+		Bucket string `json:"bucketId"`
+	}{Bucket: bucketID}
+	res := struct {
+		Bucket string `json:"bucketId"`
+		URL    string `json:"uploadUrl"`
+		Token  string `json:"authorizationToken"`
+	}{}
+	err := c.api("b2_get_upload_url", &req, &res)
+	if err != nil {
+		return "", "", err
+	}
+	if res.Bucket != bucketID {
+		panic("b2 is misbehaving badly")
+	}
+	return res.URL, res.Token, nil
+}
+
+// Upload uploads a file to a bucket.
+// Upload uses f.Name as the file name,
+// f.ContentType for the content type,
+// and f.Size for the file size.
+// f.Body should point to an io.ReadCloser
+// that will read exactly f.Size bytes until EOF.
+// f.Body.Close() will be called after the HTTP request is made.
+// (Callers who wish to avoid closing the underlying
+// stream may choose to wrap f.Body with an ioutil.NopCloser.)
+//
+// NOTE: if f.Body is a type for which net/http.NewRequest
+// provides an implementation of http.Request.GetBody,
+// then requests that fail on expired authorization tokens
+// will be re-tried if Client.AutoRetry is set.
+// Otherwise, it is the caller's responsibility to
+// re-populate f.Body and call Upload again.
+// See documentation for http.NewRequest and b2.Error.Temporary.
+//
+// BUGS: Unfortunately, based on Backblaze's documentation,
+// there are a variety of circumstances under which an upload can fail.
+// Clients should handle return values of type *b2.Error for which
+// (*b2.Error).Temporary() returns true.
+// Backblaze's own documentation suggests that upload failures
+// are frequent and unpredictable.
+func (c *Client) Upload(b *Bucket, f *File) error {
+	if len(f.Extra) > 10 {
+		return fmt.Errorf("b2 only allows 10 X-Bz-Info* headers; have %d", len(f.Extra))
+	}
+	body := f.Body
+again:
+	uri, token, err := c.upload(b.ID)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", uri, body)
+	if err != nil {
+		return fmt.Errorf("b2 returned a bad URL: %s", err)
+	}
+	if req.URL.Scheme != "https" {
+		return fmt.Errorf("refusing insecure scheme %q", req.URL.Scheme)
+	}
+	req.Header.Set("Authorization", token)
+	req.Header.Set("X-Bz-File-Name", url.PathEscape(f.Name))
+
+	// There is simply no reason to send a SHA1 here.
+	// HTTPS provides an even stronger integrity guarantee
+	// than SHA1, and we insist on https uploads.
+	// Computing a SHA1 here would be redundant and slow.
+	req.Header.Set("X-Bz-Content-Sha1", "do_not_verify")
+	if f.ContentType != "" {
+		req.Header.Set("Content-Type", f.ContentType)
+	} else {
+		req.Header.Set("Content-Type", "b2/x-auto")
+	}
+	req.Header.Set("Content-Length", strconv.FormatInt(f.Size, 10))
+	req.ContentLength = f.Size
+	for k, v := range f.Extra {
+		req.Header.Set("X-Bz-Info-"+url.PathEscape(k), url.PathEscape(v))
+	}
+
+	res, err := c.http().Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		e := &Error{Op: "b2_upload_file", Status: res.StatusCode}
+		json.NewDecoder(res.Body).Decode(e)
+		if req.GetBody == nil || !c.AutoRetry {
+			return e
+		}
+		if e.Temporary() {
+			body, err = req.GetBody()
+			if err != nil {
+				return err
+			}
+			goto again
+		}
+		e.Op = "b2_upload_file"
+		return e
+	}
+
+	resinfo := struct {
+		Account       string          `json:"accountId"`
+		Action        string          `json:"action"`
+		BucketID      string          `json:"bucketId"`
+		ContentLength int64           `json:"contentLength"`
+		ContentSHA    string          `json:"contentSha1"`
+		ContentType   string          `json:"contentType"`
+		ID            string          `json:"fileId"`
+		Info          json.RawMessage `json:"fileInfo"`
+		Name          string          `json:"fileName"`
+		Modtime       int64           `json:"uploadTimestamp"`
+	}{}
+	err = json.NewDecoder(res.Body).Decode(&resinfo)
+	if err != nil {
+		return err
+	}
+
+	// TODO: incorporate any other file info?
+	f.ID = resinfo.ID
+	f.Timestamp = resinfo.Modtime
+
+	return nil
 }

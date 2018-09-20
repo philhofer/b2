@@ -202,7 +202,6 @@ func TestHappyCase(t *testing.T) {
 	// we try to get a file, which causes a 401 to be
 	// returned, which should trigger a re-auth and
 	// another GET of the file with the new auth token
-	client.AutoRenew = true
 	realget := rt
 	expire := func(req *http.Request) (*http.Response, error) {
 		if req.Method != "GET" {
@@ -215,7 +214,7 @@ func TestHappyCase(t *testing.T) {
 			t.Error("bad host in request")
 		}
 		return &http.Response{
-			Body:       ioutil.NopCloser(strings.NewReader(`{"code": "bad_auth_token"}`)),
+			Body:       ioutil.NopCloser(strings.NewReader(`{"status": 401, "code": "bad_auth_token"}`)),
 			StatusCode: 401,
 		}, nil
 	}
@@ -272,6 +271,7 @@ func TestConcurrentReauth(t *testing.T) {
 			Value: "key-text",
 			ID:    "key-id",
 		},
+		AutoRenew: true,
 	}
 	c.mut.dl = "dl.backblaze.com"
 	c.mut.api = "api.backblaze.com"
@@ -283,7 +283,6 @@ func TestConcurrentReauth(t *testing.T) {
 	)
 
 	c.mut.Cond.L = &c.mut.Mutex
-	c.AutoRenew = true
 	c.Client = http.DefaultClient
 	c.Client.Transport = transport(func(req *http.Request) (*http.Response, error) {
 		switch req.URL.Host {
@@ -296,7 +295,7 @@ func TestConcurrentReauth(t *testing.T) {
 				return &http.Response{
 					StatusCode: 401,
 					Body: ioutil.NopCloser(strings.NewReader(`
-{"code": "bad_auth_token"}`)),
+{"status": 401, "code": "bad_auth_token"}`)),
 				}, nil
 			}
 			runtime.Gosched()
