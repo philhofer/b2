@@ -755,7 +755,9 @@ func (c *Client) ListBucket(bucket *Bucket, start string, max int) ([]FileInfo, 
 	}
 	req := struct {
 		Bucket string `json:"bucketId"`
-	}{bucket.ID}
+		Next   string `json:"startFileName"`
+		Max    int    `json:"maxFileCount"`
+	}{bucket.ID, start, max}
 	res := struct {
 		Files []FileInfo `json:"files"`
 		Next  *string    `json:"nextFileName"`

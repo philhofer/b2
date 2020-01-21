@@ -84,7 +84,10 @@ func list(bucket string, subr func(fi *b2.FileInfo)) {
 
 	prefix := ""
 	for {
-		fis, next, err := c.ListBucket(b, prefix, 100)
+		// you only get charged for one transaction for
+		// listing up to 1000 results, so that's the most
+		// cost-effective listing multiple
+		fis, next, err := c.ListBucket(b, prefix, 1000)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
