@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"mime"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -202,44 +205,57 @@ func (d *debouncer) release() {
 }
 
 type urlentry struct {
-	cached []struct {
-		url, auth string
-	}
+	orig      time.Time
+	next      *urlentry
+	url, auth string
 }
 
+// b2 'upload authorizations' can be re-used
+// to upload additional files, and re-using them
+// saves an enormously expensive (~500ms) round-trip
+// on each upload, so this is a cache to hold on
+// to them for up to 24 hours (the documented expiration time)
+const uploadExpiry = 24 * time.Hour
 type urlcache struct {
 	sync.Mutex
 	tbl map[string]*urlentry
 }
 
-func (u *urlcache) get(bucket string) (string, string, bool) {
+func (u *urlcache) get(bucket string) *urlentry {
 	u.Lock()
 	defer u.Unlock()
-	e, ok := u.tbl[bucket]
-	if !ok {
-		return "", "", false
+	if u.tbl == nil {
+		u.tbl = make(map[string]*urlentry)
+		return nil
 	}
-	l := len(e.cached)
-	if l > 0 {
-		c := &e.cached[l-1]
-		auth, url := c.auth, c.url
-		e.cached = e.cached[:l-1]
-		return url, auth, true
+	e := u.tbl[bucket]
+	for e != nil && time.Since(e.orig) >= uploadExpiry {
+		e = e.next
 	}
-	return "", "", false
+	if e == nil {
+		delete(u.tbl, bucket)
+	} else {
+		u.tbl[bucket] = e.next
+		e.next = nil
+	}
+	return e
 }
 
-func (u *urlcache) put(bucket, url, auth string) {
+func (u *urlcache) put(bucket string, ent *urlentry) {
+	if ent.orig.IsZero() || time.Since(ent.orig) >= uploadExpiry {
+		return
+	}
 	u.Lock()
 	defer u.Unlock()
-	e := u.tbl[bucket]
-	if e == nil {
-		e = new(urlentry)
-		u.tbl[bucket] = e
+	if u.tbl == nil {
+		u.tbl = make(map[string]*urlentry)
 	}
-	e.cached = append(e.cached, struct {
-		url, auth string
-	}{url, auth})
+	next := u.tbl[bucket]
+	for next != nil && time.Since(next.orig) >= uploadExpiry {
+		next = next.next
+	}
+	ent.next = next
+	u.tbl[bucket] = ent
 }
 
 // Client represents a client to the Backblaze b2 API.
@@ -426,7 +442,7 @@ func (k *Key) authorize(cl *http.Client, dst *Client, init bool) error {
 
 func (c *Client) http() *http.Client {
 	if c.Client == nil {
-		c.Client = http.DefaultClient
+		return http.DefaultClient
 	}
 	return c.Client
 }
@@ -547,6 +563,53 @@ type FileInfo struct {
 
 func (f *FileInfo) Created() time.Time {
 	return time.Unix(f.Timestamp/1000, (f.Timestamp%1000)*1000000)
+}
+
+// FromOSInfo populates the Name and Size
+// fields of the receiver based on the
+// provided os.FileInfo.
+// If the receiver's ContentType field is
+// empty, the ContentType will be determined
+// from the file extension.
+func (f *FileInfo) FromOSInfo(fi os.FileInfo) {
+	name := fi.Name()
+	f.Name = name
+	f.Size = fi.Size()
+	if f.ContentType == "" {
+		sys := fi.Sys()
+		if of, ok := sys.(*FileInfo); ok && of.ContentType != "" {
+			f.ContentType = of.ContentType
+		} else if ext := filepath.Ext(name); ext != "" {
+			f.ContentType = mime.TypeByExtension(ext)
+		}
+	}
+}
+
+// wrapper around *FileInfo that implements os.FileInfo
+type osInfo struct {
+	f *FileInfo
+}
+
+var _ os.FileInfo = osInfo{}
+
+func (o osInfo) Name() string       { return o.f.Name }
+func (o osInfo) Size() int64        { return o.f.Size }
+func (o osInfo) ModTime() time.Time { return o.f.Created() }
+func (o osInfo) IsDir() bool        { return o.f.Type == "folder" }
+func (o osInfo) Mode() os.FileMode {
+	mode := os.FileMode(666) // I guess this is about right?
+	if o.f.Type == "folder" {
+		mode |= os.ModeDir
+	}
+	return mode
+}
+func (o osInfo) Sys() interface{} { return o.f }
+
+// ToOSInfo returns a reference to f
+// inside a thin wrapper that implements
+// the os.FileInfo interface.
+func (f *FileInfo) ToOSInfo() os.FileInfo {
+	return osInfo{f}
 }
 
 // File is a complete file, including metadata.
@@ -819,16 +882,16 @@ func (c *Client) NewKey(key *Key, valid time.Duration) error {
 }
 
 // acquire an upload url and auth token for a bucket
-func (c *Client) upload(bucketID string) (string, string, error) {
+func (c *Client) upload(bucketID string) (*urlentry, error) {
 	if !c.has(CapWriteFiles) {
-		return "", "", fmt.Errorf("cap %q cannot write files", c.Key.Cap.String())
+		return nil, fmt.Errorf("cap %q cannot write files", c.Key.Cap.String())
 	}
 
 	// see if we can grab a recently-used
 	// upload authorization from the cache...
-	url, auth, ok := c.uploads.get(bucketID)
-	if ok {
-		return url, auth, nil
+	e := c.uploads.get(bucketID)
+	if e != nil {
+		return e, nil
 	}
 
 	req := struct {
@@ -841,12 +904,16 @@ func (c *Client) upload(bucketID string) (string, string, error) {
 	}{}
 	err := c.api("b2_get_upload_url", &req, &res)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 	if res.Bucket != bucketID {
 		panic("b2 is misbehaving badly")
 	}
-	return res.URL, res.Token, nil
+	return &urlentry{
+		orig: time.Now(),
+		url:  res.URL,
+		auth: res.Token,
+	}, nil
 }
 
 // Upload uploads a file to a bucket.
@@ -879,18 +946,18 @@ func (c *Client) Upload(b *Bucket, f *File) error {
 	}
 	body := f.Body
 again:
-	uri, token, err := c.upload(b.ID)
+	token, err := c.upload(b.ID)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest("POST", uri, body)
+	req, err := http.NewRequest("POST", token.url, body)
 	if err != nil {
 		return fmt.Errorf("b2 returned a bad URL: %s", err)
 	}
 	if req.URL.Scheme != "https" {
 		return fmt.Errorf("refusing insecure scheme %q", req.URL.Scheme)
 	}
-	req.Header.Set("Authorization", token)
+	req.Header.Set("Authorization", token.auth)
 	req.Header.Set("X-Bz-File-Name", url.PathEscape(f.Name))
 
 	// There is simply no reason to send a SHA1 here.
@@ -947,6 +1014,8 @@ again:
 	if err != nil {
 		return err
 	}
+
+	c.uploads.put(b.ID, token)
 
 	// TODO: incorporate any other file info?
 	f.ID = resinfo.ID
