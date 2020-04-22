@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -211,38 +212,40 @@ func put(bucket string, files []string) {
 		os.Exit(1)
 	}
 
-	fds := make([]*os.File, len(files))
-	for i := range files {
-		fds[i], err = os.Open(files[i])
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-	}
-
 	concurrency := 20
-	if len(fds) < concurrency {
-		concurrency = len(fds)
+	if len(files) < concurrency {
+		concurrency = len(files)
 	}
 	wg := new(sync.WaitGroup)
-	fc := make(chan *os.File, concurrency)
+	fc := make(chan string, concurrency)
+	errcount := int64(0)
 	wg.Add(concurrency)
 	for i := 0; i < concurrency; i++ {
 		go func() {
-			for f := range fc {
-				err := uploadFile(c, b, f)
+			for name := range fc {
+				f, err := os.Open(name)
 				if err != nil {
 					fmt.Fprintln(os.Stderr, err)
+					atomic.AddInt64(&errcount, 1)
+					continue
+				}
+				err = uploadFile(c, b, f)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					atomic.AddInt64(&errcount, 1)
 				}
 			}
 			wg.Done()
 		}()
 	}
-	for i := range fds {
-		fc <- fds[i]
+	for i := range files {
+		fc <- files[i]
 	}
 	close(fc)
 	wg.Wait()
+	if errcount > 0 {
+		os.Exit(1)
+	}
 }
 
 func keys() {
@@ -290,7 +293,7 @@ func main() {
 		if len(args) < 2 {
 			usage()
 		}
-		list(args[1], func (fi *b2.FileInfo) {
+		list(args[1], func(fi *b2.FileInfo) {
 			fmt.Printf("%s %s %d\n", fi.Type, fi.Name, fi.Size)
 		})
 	case "sync":
