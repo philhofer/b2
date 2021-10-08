@@ -25,6 +25,8 @@ const (
 	CapWriteKeys
 	CapDeleteKeys
 	CapListBuckets
+	CapListAllBucketNames // for S3 ListBuckets
+	CapReadBuckets
 	CapWriteBuckets
 	CapDeleteBuckets
 	CapListFiles
@@ -44,6 +46,8 @@ var captable = []struct {
 	{CapWriteKeys, "writeKeys"},
 	{CapDeleteKeys, "deleteKeys"},
 	{CapListBuckets, "listBuckets"},
+	{CapListAllBucketNames, "listAllBucketNames"},
+	{CapReadBuckets, "readBuckets"}, // not documented, but returned from the API nonetheless...
 	{CapWriteBuckets, "writeBuckets"},
 	{CapDeleteBuckets, "deleteBuckets"},
 	{CapListFiles, "listFiles"},
@@ -216,6 +220,7 @@ type urlentry struct {
 // on each upload, so this is a cache to hold on
 // to them for up to 24 hours (the documented expiration time)
 const uploadExpiry = 24 * time.Hour
+
 type urlcache struct {
 	sync.Mutex
 	tbl map[string]*urlentry

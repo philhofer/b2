@@ -26,25 +26,46 @@ func usage() {
 }
 
 var (
-	kid string
-	key string
+	kid     string
+	key     string
+	verbose bool
+
+	lastname   string
+	lastbucket *b2.Bucket
+	lastauth   *b2.Client
 )
 
 func init() {
 	flag.StringVar(&kid, "i", os.Getenv("B2_KEY_ID"), "B2 key ID (B2_KEY_ID)")
 	flag.StringVar(&key, "k", os.Getenv("B2_KEY"), "B2 key (B2_KEY)")
+	flag.BoolVar(&verbose, "v", false, "be verbose")
+}
+
+func fatalln(args ...interface{}) {
+	fmt.Fprintln(os.Stderr, args...)
+	os.Exit(1)
+}
+
+func debugln(args ...interface{}) {
+	fmt.Fprintln(os.Stderr, args...)
 }
 
 func auth() *b2.Client {
+	if lastauth != nil {
+		return lastauth
+	}
 	if kid == "" || key == "" {
 		fmt.Fprintln(os.Stderr, "need B2 key and key ID (-k and -i)")
 		os.Exit(1)
 	}
 	c, err := (&b2.Key{ID: kid, Value: key}).Authorize(nil)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		fatalln(err)
 	}
+	if verbose {
+		debugln(" > Authorize()'d successfully")
+	}
+	lastauth = c
 	return c
 }
 
@@ -52,11 +73,13 @@ func get(bucket, file string) {
 	c := auth()
 	f, err := c.Get(bucket, file)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		fatalln(err)
 	}
 	defer f.Body.Close()
-	io.Copy(os.Stdout, f.Body)
+	_, err = io.Copy(os.Stdout, f.Body)
+	if err != nil {
+		fatalln(err)
+	}
 }
 
 func caps() {
@@ -65,38 +88,27 @@ func caps() {
 
 func list(bucket string, subr func(fi *b2.FileInfo)) {
 	c := auth()
-
-	buckets, err := c.Buckets()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	var b *b2.Bucket
-	for i := range buckets {
-		if buckets[i].Name == bucket {
-			b = &buckets[i]
-			break
-		}
-	}
-	if b == nil {
-		fmt.Fprintln(os.Stderr, "bucket doesn't exist")
-		os.Exit(1)
-	}
+	b := bucketnamed(bucket, c)
 
 	prefix := ""
 	for {
 		// you only get charged for one transaction for
 		// listing up to 1000 results, so that's the most
 		// cost-effective listing multiple
+		if verbose {
+			debugln(" > running ListBucket, prefix =", prefix)
+		}
 		fis, next, err := c.ListBucket(b, prefix, 1000)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			fatalln(err)
 		}
 		for i := range fis {
 			subr(&fis[i])
 		}
 		if next == "" {
+			if verbose {
+				debugln(" > ListBucket terminated")
+			}
 			break
 		}
 		prefix = next
@@ -106,24 +118,53 @@ func list(bucket string, subr func(fi *b2.FileInfo)) {
 func buckets() {
 	buckets, err := auth().Buckets()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		fatalln(err)
 	}
 	for i := range buckets {
 		fmt.Printf("%s %s %s\n", buckets[i].Name, buckets[i].Type, buckets[i].ID)
 	}
 }
 
+func bucketnamed(name string, c *b2.Client) *b2.Bucket {
+	if name == "" {
+		fatalln("emtpy bucket name")
+	}
+	// cache the most-recently-resolved bucket name,
+	// because commands like "sync" would otherwise
+	// end up resolving the bucket name twice
+	if lastname != "" && name == lastname {
+		return lastbucket
+	}
+	buckets, err := c.Buckets()
+	if err != nil {
+		fatalln(err)
+	}
+	for i := range buckets {
+		if buckets[i].Name == name {
+			if verbose {
+				debugln(" > resolved bucket name", name)
+			}
+			// don't return &buckets[i],
+			// because then we'd effectively leak
+			// the rest of the buckets array...
+			lastbucket = new(b2.Bucket)
+			*lastbucket = buckets[i]
+			lastname = name
+			return lastbucket
+		}
+	}
+	fatalln("no such bucket")
+	return nil
+}
+
 func newkey(name, caps, ttl string) {
 	c, err := b2.ParseCapabilities(caps)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		fatalln("bad capabilities:", err)
 	}
 	d, err := time.ParseDuration(ttl)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		fatalln("bad ttl:", err)
 	}
 	k := b2.Key{
 		Name: name,
@@ -131,8 +172,7 @@ func newkey(name, caps, ttl string) {
 	}
 	err = auth().NewKey(&k, d)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		fatalln(err)
 	}
 	fmt.Fprintln(os.Stdout, k.ID, k.Value, k.Expires())
 }
@@ -152,6 +192,9 @@ func uploadFile(c *b2.Client, b *b2.Bucket, f *os.File) error {
 	b2f.FromOSInfo(ino)
 
 	for {
+		if verbose {
+			debugln(" > beginning upload of", b2f.Name)
+		}
 		err = c.Upload(b, &b2f)
 		if err == nil {
 			break
@@ -184,33 +227,18 @@ func dosync(bucket string, files []string) {
 		delete(table, fi.Name)
 	})
 
-	newfiles := make([]string, 0, len(table))
-	for k := range table {
-		newfiles = append(newfiles, k)
-	}
-	if len(newfiles) > 0 {
+	if len(table) > 0 {
+		newfiles := make([]string, 0, len(table))
+		for k := range table {
+			newfiles = append(newfiles, k)
+		}
 		put(bucket, newfiles)
 	}
 }
 
 func put(bucket string, files []string) {
 	c := auth()
-	buckets, err := c.Buckets()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	var b *b2.Bucket
-	for i := range buckets {
-		if buckets[i].Name == bucket {
-			b = &buckets[i]
-			break
-		}
-	}
-	if b == nil {
-		fmt.Fprintln(os.Stderr, "no such bucket", bucket)
-		os.Exit(1)
-	}
+	b := bucketnamed(bucket, c)
 
 	concurrency := 20
 	if len(files) < concurrency {
@@ -220,6 +248,9 @@ func put(bucket string, files []string) {
 	fc := make(chan string, concurrency)
 	errcount := int64(0)
 	wg.Add(concurrency)
+	if verbose {
+		debugln(" > beginning upload, #files =", len(files))
+	}
 	for i := 0; i < concurrency; i++ {
 		go func() {
 			for name := range fc {
@@ -242,6 +273,9 @@ func put(bucket string, files []string) {
 		fc <- files[i]
 	}
 	close(fc)
+	if verbose {
+		debugln(" > waiting for all uploads...")
+	}
 	wg.Wait()
 	if errcount > 0 {
 		os.Exit(1)
