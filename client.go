@@ -36,6 +36,8 @@ const (
 	CapDeleteFiles
 	CapReadBucketEncryption
 	CapWriteBucketEncryption
+	CapReadBucketReplications
+	CapWriteBucketReplications
 )
 
 var str2cap map[string]Capabilities
@@ -59,6 +61,8 @@ var captable = []struct {
 	{CapDeleteFiles, "deleteFiles"},
 	{CapReadBucketEncryption, "readBucketEncryption"},
 	{CapWriteBucketEncryption, "writeBucketEncryption"},
+	{CapReadBucketReplications, "readBucketReplications"},
+	{CapWriteBucketReplications, "writeBucketReplications"},
 }
 
 func init() {
